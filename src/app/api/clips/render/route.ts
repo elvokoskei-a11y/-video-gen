@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getClipperEngine } from "@/lib/clipper-engine";
 import { SESSION_STORE } from "@/lib/session-store";
-import { renderClip, getClipOutputPath, CLIPS_DIR } from "@/lib/media/ffmpeg-service";
+import { renderClip, getClipOutputPath, CLIPS_DIR, validateOutputQuality } from "@/lib/media/ffmpeg-service";
 import { mkdir } from "fs/promises";
 import path from "path";
 import type { CaptionLine } from "@/lib/media/ffmpeg-service";
@@ -22,6 +22,10 @@ export async function POST(request: NextRequest) {
       withHookOverlay = false,
       startTime: overrideStart,
       endTime: overrideEnd,
+      qualityMode = "source-preserving", // New: quality mode
+      crf,
+      preset,
+      codec,
     } = body;
 
     if (!sessionId || !candidateId) {
@@ -82,7 +86,9 @@ export async function POST(request: NextRequest) {
       ? candidate.hook.suggestedOverlay ?? candidate.hook.text
       : undefined;
 
-    // Render the clip
+    console.log(`[Render] Starting ${qualityMode} mode render for ${sessionId}/${candidateId}`);
+
+    // Render the clip with quality preservation
     const result = await renderClip({
       inputPath: session.videoId,
       outputPath,
@@ -90,20 +96,44 @@ export async function POST(request: NextRequest) {
       endTime,
       aspectRatio: aspectRatio as any,
       resolution: resolution as any,
-      fps: session.metadata?.fps ?? 30,
+      fps: qualityMode === "source-preserving" ? "source" : (session.metadata?.fps ?? 30),
       captions,
       withHookOverlay: hookText,
       normalizeAudio: true,
       fadeDuration: 0.2,
+      qualityMode: qualityMode as any,
+      crf,
+      preset,
+      codec: codec as any,
+      sourceMetadata: session.metadata,
       onProgress: (pct) => {
-        // Could emit via SSE or WebSocket in production
-        // For now just log
         if (pct % 20 === 0) console.log(`[Render] ${pct}%`);
       },
     });
 
+    // Validate output quality
+    const validation = await validateOutputQuality(
+      session.videoId,
+      result.outputPath,
+      {
+        width: qualityMode === "source-preserving" && aspectRatio === "source" 
+          ? session.metadata?.width 
+          : undefined,
+        height: qualityMode === "source-preserving" && aspectRatio === "source"
+          ? session.metadata?.height
+          : undefined,
+      }
+    );
+
+    console.log(`[Render] Quality validation: ${validation.passed ? "PASSED" : "FAILED"}`);
+    if (validation.warnings.length > 0) {
+      console.warn(`[Render] Warnings:`, validation.warnings);
+    }
+    if (validation.errors.length > 0) {
+      console.error(`[Render] Errors:`, validation.errors);
+    }
+
     // Generate a public URL for the output file
-    // In production this would be uploaded to cloud storage
     const fileName = path.basename(outputPath);
     const outputUrl = `/api/clips/download/${sessionId}/${candidateId}/${encodeURIComponent(fileName)}`;
 
@@ -116,6 +146,13 @@ export async function POST(request: NextRequest) {
       aspectRatio,
       resolution,
       withCaptions,
+      qualityMode,
+      validation: {
+        passed: validation.passed,
+        report: validation.report,
+        warnings: validation.warnings,
+        errors: validation.errors,
+      },
     });
   } catch (err) {
     console.error("[/api/clips/render]", err);

@@ -28,6 +28,7 @@ export async function checkSystemHealth(): Promise<SystemHealth> {
   const checks = await Promise.allSettled([
     checkGemini(),
     checkNvidia(),
+    checkDeepSeek(),
     checkDatabase(),
     checkStorage(),
     checkFFmpeg(),
@@ -145,6 +146,52 @@ async function checkNvidia(): Promise<ProviderHealth> {
   } catch (err: any) {
     return {
       name: "NVIDIA",
+      type: "ai",
+      status: "error",
+      model,
+      note: err?.name === "TimeoutError" ? "Connection timeout" : `Connection failed: ${err?.message?.slice(0, 80)}`,
+      checkedAt,
+    };
+  }
+}
+
+async function checkDeepSeek(): Promise<ProviderHealth> {
+  const key = process.env.NVIDIA_API_KEY;
+  const baseUrl = process.env.NVIDIA_BASE_URL ?? "https://integrate.api.nvidia.com/v1";
+  const model = process.env.NVIDIA_MODEL ?? "deepseek-ai/deepseek-r1";
+  const checkedAt = new Date().toISOString();
+
+  // Only check DeepSeek if using DeepSeek model via NVIDIA
+  if (!key || !model.includes("deepseek")) {
+    return {
+      name: "DeepSeek",
+      type: "ai",
+      status: "not_configured",
+      model,
+      note: "DeepSeek not configured. Set NVIDIA_MODEL=deepseek-ai/deepseek-r1 to use DeepSeek via NVIDIA.",
+      checkedAt,
+    };
+  }
+
+  const start = Date.now();
+  try {
+    // Test minimal request to NVIDIA API with DeepSeek model
+    const res = await fetch(`${baseUrl}/models`, {
+      headers: { Authorization: `Bearer ${key}` },
+      signal: AbortSignal.timeout(5000),
+    });
+    const latencyMs = Date.now() - start;
+
+    if (res.ok) {
+      return { name: "DeepSeek", type: "ai", status: "connected", latencyMs, model, checkedAt };
+    } else if (res.status === 401 || res.status === 403) {
+      return { name: "DeepSeek", type: "ai", status: "error", model, note: `Auth error (${res.status})`, checkedAt };
+    } else {
+      return { name: "DeepSeek", type: "ai", status: "degraded", model, note: `HTTP ${res.status}`, checkedAt };
+    }
+  } catch (err: any) {
+    return {
+      name: "DeepSeek",
       type: "ai",
       status: "error",
       model,
@@ -288,10 +335,23 @@ async function checkWorker(): Promise<ProviderHealth> {
 export function determineAIMode(): string {
   const hasGemini = !!process.env.GEMINI_API_KEY;
   const hasNvidia = !!process.env.NVIDIA_API_KEY;
+  const nvidiaModel = process.env.NVIDIA_MODEL ?? "";
+  const isDeepSeek = nvidiaModel.includes("deepseek");
+  const primaryProvider = process.env.AI_PRIMARY_PROVIDER || "gemini";
+  const fallbackProvider = process.env.AI_FALLBACK_PROVIDER;
+  const autoFailover = process.env.AI_AUTO_FAILOVER !== "false";
 
-  if (hasGemini && hasNvidia) return "both (Gemini + NVIDIA)";
+  if (hasGemini && hasNvidia) {
+    const providers = isDeepSeek 
+      ? `Gemini + DeepSeek (via NVIDIA)` 
+      : `Gemini + NVIDIA`;
+    const failoverText = autoFailover && fallbackProvider
+      ? ` | Failover: ${primaryProvider} → ${fallbackProvider}`
+      : "";
+    return `${providers}${failoverText}`;
+  }
   if (hasGemini) return "gemini";
-  if (hasNvidia) return "nvidia";
+  if (hasNvidia) return isDeepSeek ? "deepseek (via NVIDIA)" : "nvidia";
   return "NOT CONFIGURED — AI analysis unavailable";
 }
 

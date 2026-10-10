@@ -54,9 +54,60 @@ export async function inspectVideo(filePath: string): Promise<VideoMetadata> {
         fps = parseFloat(fpsStr) || 30;
       }
 
+      // Parse average frame rate separately
+      let avgFps = fps;
+      const avgFpsStr = videoStream.avg_frame_rate ?? videoStream.r_frame_rate ?? "30";
+      if (avgFpsStr.includes("/")) {
+        const [num, den] = avgFpsStr.split("/").map(Number);
+        avgFps = den > 0 ? Math.round((num / den) * 100) / 100 : 30;
+      } else {
+        avgFps = parseFloat(avgFpsStr) || 30;
+      }
+
+      // Detect variable frame rate
+      const isVariableFrameRate = Math.abs(fps - avgFps) > 0.5;
+
       // Compute aspect ratio
       const gcd = computeGcd(width, height);
       const aspectRatio = gcd > 0 ? `${width / gcd}:${height / gcd}` : `${width}:${height}`;
+
+      // Extract display aspect ratio if present
+      const displayAspectRatio = videoStream.display_aspect_ratio || aspectRatio;
+      
+      // Sample aspect ratio
+      const sampleAspectRatio = videoStream.sample_aspect_ratio || "1:1";
+
+      // Rotation metadata
+      const rotation = parseInt(String(videoStream.rotation ?? videoStream.tags?.rotate ?? "0"), 10);
+
+      // Pixel format and bit depth
+      const pixelFormat = videoStream.pix_fmt || "yuv420p";
+      let bitDepth = 8;
+      if (pixelFormat.includes("10le") || pixelFormat.includes("10be")) bitDepth = 10;
+      if (pixelFormat.includes("12le") || pixelFormat.includes("12be")) bitDepth = 12;
+      if (pixelFormat.includes("16le") || pixelFormat.includes("16be")) bitDepth = 16;
+
+      // Codec details
+      const codecProfile = videoStream.profile ? String(videoStream.profile) : undefined;
+      const codecLevel = videoStream.level ? String(videoStream.level) : undefined;
+
+      // Color space information
+      const colorPrimaries = videoStream.color_primaries || undefined;
+      const colorTransfer = videoStream.color_transfer || undefined;
+      const colorSpace = videoStream.color_space || undefined;
+
+      // HDR detection (simplified - looks for common HDR indicators)
+      const hasHDR = 
+        colorTransfer === "smpte2084" || 
+        colorTransfer === "arib-std-b67" ||
+        pixelFormat.includes("p010") ||
+        (videoStream as any).color_range === "tv" && bitDepth >= 10;
+
+      // Audio details
+      const audioSampleRate = audioStream?.sample_rate ? parseInt(String(audioStream.sample_rate), 10) : undefined;
+
+      // Time base
+      const timeBase = videoStream.time_base || undefined;
 
       const metadata: VideoMetadata = {
         duration: Number(format.duration ?? 0),
@@ -72,6 +123,29 @@ export async function inspectVideo(filePath: string): Promise<VideoMetadata> {
         format: format.format_name ?? "unknown",
         aspectRatio,
         hasAudio: !!audioStream,
+        // Enhanced metadata
+        displayAspectRatio,
+        sampleAspectRatio,
+        pixelFormat,
+        bitDepth,
+        codecProfile,
+        codecLevel,
+        avgFrameRate: avgFpsStr,
+        rFrameRate: fpsStr,
+        isVariableFrameRate,
+        rotation,
+        colorPrimaries,
+        colorTransfer,
+        colorSpace,
+        hasHDR,
+        audioSampleRate,
+        timeBase,
+        streamMetadata: {
+          videoStreamIndex: videoStream.index,
+          audioStreamIndex: audioStream?.index,
+          rawVideoStream: videoStream,
+          rawAudioStream: audioStream,
+        },
       };
 
       resolve(metadata);
@@ -177,9 +251,9 @@ export interface RenderClipOptions {
   outputPath: string;
   startTime: number;
   endTime: number;
-  aspectRatio: "9:16" | "1:1" | "16:9" | "4:5";
-  resolution: "720p" | "1080p" | "source";
-  fps?: number;
+  aspectRatio: "9:16" | "1:1" | "16:9" | "4:5" | "source";
+  resolution: "720p" | "1080p" | "1440p" | "2160p" | "source";
+  fps?: number | "source";
   captions?: CaptionLine[];
   withHookOverlay?: string;   // text to display as overlay
   normalizeAudio?: boolean;
@@ -187,6 +261,13 @@ export interface RenderClipOptions {
   onProgress?: (percent: number) => void;
   /** @internal temp files to clean up after render — set by renderClip() */
   _captionTempFiles?: string[];
+  // Quality preservation options
+  qualityMode?: "source-preserving" | "vertical-social" | "custom";
+  crf?: number;               // 16-18 recommended for high quality
+  preset?: "ultrafast" | "fast" | "medium" | "slow" | "veryslow";
+  codec?: "h264" | "h265";
+  preserveHDR?: boolean;
+  sourceMetadata?: VideoMetadata;  // Pass in for quality-aware decisions
 }
 
 export interface CaptionLine {
@@ -209,26 +290,64 @@ export async function renderClip(options: RenderClipOptions): Promise<{
     endTime,
     aspectRatio,
     resolution,
-    fps = 30,
     captions = [],
     withHookOverlay,
     normalizeAudio = true,
     fadeDuration = 0.3,
     onProgress,
+    qualityMode = "source-preserving",
+    sourceMetadata,
   } = options;
 
   const duration = endTime - startTime;
 
-  // Target dimensions
-  const dims = getOutputDimensions(aspectRatio, resolution);
+  // Get or inspect source metadata
+  let metadata = sourceMetadata;
+  if (!metadata) {
+    console.log("[renderClip] Inspecting source video for quality-aware rendering...");
+    try {
+      metadata = await inspectVideo(inputPath);
+    } catch (err) {
+      console.warn("[renderClip] Failed to inspect video, using defaults:", err);
+    }
+  }
 
-  // Build video filter chain
+  // Determine quality profile based on mode
+  const qualityProfile = buildQualityProfile(qualityMode, aspectRatio, resolution, options, metadata);
+  
+  console.log(`[renderClip] Quality Mode: ${qualityMode}`);
+  console.log(`[renderClip] Source: ${metadata?.width}x${metadata?.height} @ ${metadata?.fps}fps`);
+  console.log(`[renderClip] Target: ${qualityProfile.targetWidth}x${qualityProfile.targetHeight} @ ${qualityProfile.targetFps}fps`);
+  console.log(`[renderClip] Codec: ${qualityProfile.codec}, CRF: ${qualityProfile.crf}, Preset: ${qualityProfile.preset}`);
+
+  // Build video filter chain dynamically
   const filters: string[] = [];
 
-  // Crop/scale for aspect ratio
-  filters.push(buildCropFilter(dims.width, dims.height, aspectRatio));
-  filters.push(`scale=${dims.width}:${dims.height}:force_original_aspect_ratio=decrease`);
-  filters.push(`pad=${dims.width}:${dims.height}:(ow-iw)/2:(oh-ih)/2:black`);
+  // Only apply scaling/cropping if needed
+  if (qualityMode === "source-preserving" && aspectRatio === "source") {
+    // No cropping or scaling - preserve source dimensions
+    console.log("[renderClip] Source-preserving mode: no dimension changes");
+  } else if (qualityMode === "vertical-social") {
+    // Intelligent reframing for vertical social
+    const verticalFilters = buildVerticalSocialFilters(
+      qualityProfile.targetWidth!,
+      qualityProfile.targetHeight!,
+      metadata,
+      options.sourceMetadata?.width || 1920
+    );
+    filters.push(...verticalFilters);
+  } else {
+    // Custom mode with explicit dimensions
+    if (qualityProfile.targetWidth && qualityProfile.targetHeight) {
+      const scaleFilters = buildScaleFilters(
+        qualityProfile.targetWidth,
+        qualityProfile.targetHeight,
+        aspectRatio,
+        metadata
+      );
+      filters.push(...scaleFilters);
+    }
+  }
 
   // Fade in/out
   if (fadeDuration > 0) {
@@ -249,8 +368,6 @@ export async function renderClip(options: RenderClipOptions): Promise<{
       console.warn("[FFmpeg] Some bundled fonts unavailable — using available fallback");
     }
   } catch (fontErr) {
-    // If no bundled fonts are available, fail the render rather than silently
-    // rendering with system fonts (which may not exist on the worker)
     throw new Error(
       `Font registry error: ${fontErr instanceof Error ? fontErr.message : String(fontErr)}. ` +
       `Ensure assets/fonts/Inter-Regular.ttf is present in the deployment.`
@@ -259,17 +376,14 @@ export async function renderClip(options: RenderClipOptions): Promise<{
 
   // Caption overlay — burn in subtitles via drawtext with bundled font
   if (captions.length > 0) {
-    // Write caption texts to temp files to avoid shell escaping issues entirely.
-    // This is the safest approach for arbitrary text content.
     const tempCaptionFiles: string[] = [];
 
     for (const line of captions.slice(0, 50)) {
       const relStart = Math.max(0, line.startTime - startTime);
       const relEnd = Math.min(duration, Math.max(relStart + 0.1, line.endTime - startTime));
-      const yPos = aspectRatio === "9:16" ? `h*0.75` : `h*0.85`;
-      const fontSize = aspectRatio === "9:16" ? 30 : 26;
+      const yPos = aspectRatio === "9:16" || qualityMode === "vertical-social" ? `h*0.75` : `h*0.85`;
+      const fontSize = aspectRatio === "9:16" || qualityMode === "vertical-social" ? 30 : 26;
 
-      // Write text to a temp file — avoids ALL FFmpeg drawtext escaping issues
       const tmpFile = path.join(os.tmpdir(), `caption_${Date.now()}_${Math.random().toString(36).slice(2)}.txt`);
       fs.writeFileSync(tmpFile, line.text, "utf8");
       tempCaptionFiles.push(tmpFile);
@@ -285,11 +399,10 @@ export async function renderClip(options: RenderClipOptions): Promise<{
       );
     }
 
-    // Clean up temp files after render completes (store ref for cleanup)
     options._captionTempFiles = tempCaptionFiles;
   }
 
-  // Hook text overlay (editorial — labeled as such)
+  // Hook text overlay
   if (withHookOverlay) {
     const tmpHookFile = path.join(os.tmpdir(), `hook_${Date.now()}.txt`);
     fs.writeFileSync(tmpHookFile, withHookOverlay, "utf8");
@@ -306,30 +419,68 @@ export async function renderClip(options: RenderClipOptions): Promise<{
     );
   }
 
-  const vf = filters.join(",");
+  const vf = filters.length > 0 ? filters.join(",") : undefined;
 
   return new Promise((resolve, reject) => {
     const cmd = ffmpeg(inputPath)
       .seekInput(startTime)
-      .duration(duration)
-      .videoFilters(vf)
-      .videoCodec("libx264")
-      .outputOptions([
-        `-preset fast`,
-        `-crf 23`,
-        `-r ${fps}`,
-        `-movflags +faststart`,
-        `-pix_fmt yuv420p`,
-      ]);
+      .duration(duration);
 
-    if (normalizeAudio && options.inputPath) {
-      cmd.audioCodec("aac")
-        .audioBitrate("128k")
-        .audioFilters([
-          `loudnorm=I=-16:TP=-1.5:LRA=11`,
-          `afade=in:st=0:d=${fadeDuration}`,
-          `afade=out:st=${Math.max(0, duration - fadeDuration)}:d=${fadeDuration}`,
-        ]);
+    // Apply video filters only if we have any
+    if (vf) {
+      cmd.videoFilters(vf);
+    }
+
+    // Video encoding with quality profile
+    const videoCodec = qualityProfile.codec === "h265" ? "libx265" : "libx264";
+    cmd.videoCodec(videoCodec);
+
+    const videoOptions: string[] = [
+      `-preset ${qualityProfile.preset}`,
+      `-crf ${qualityProfile.crf}`,
+      `-movflags +faststart`,
+    ];
+
+    // Frame rate handling
+    if (qualityProfile.targetFps !== "source" && qualityProfile.targetFps) {
+      videoOptions.push(`-r ${qualityProfile.targetFps}`);
+    } else if (metadata?.fps) {
+      videoOptions.push(`-r ${metadata.fps}`);
+    }
+
+    // Pixel format - preserve HDR if requested and present
+    if (qualityProfile.preserveHDR && metadata?.hasHDR && metadata?.pixelFormat) {
+      videoOptions.push(`-pix_fmt ${metadata.pixelFormat}`);
+      // Preserve color metadata for HDR
+      if (metadata.colorPrimaries) videoOptions.push(`-color_primaries ${metadata.colorPrimaries}`);
+      if (metadata.colorTransfer) videoOptions.push(`-color_trc ${metadata.colorTransfer}`);
+      if (metadata.colorSpace) videoOptions.push(`-colorspace ${metadata.colorSpace}`);
+    } else {
+      videoOptions.push(`-pix_fmt yuv420p`);
+    }
+
+    cmd.outputOptions(videoOptions);
+
+    // Audio handling - preserve quality where possible
+    if (metadata?.hasAudio) {
+      if (normalizeAudio) {
+        const audioBitrate = determineAudioBitrate(metadata, qualityProfile.audioQuality);
+        cmd.audioCodec("aac")
+          .audioBitrate(audioBitrate)
+          .audioFilters([
+            `loudnorm=I=-16:TP=-1.5:LRA=11`,
+            `afade=in:st=0:d=${fadeDuration}`,
+            `afade=out:st=${Math.max(0, duration - fadeDuration)}:d=${fadeDuration}`,
+          ]);
+      } else {
+        // Try to copy audio stream if no processing needed
+        if (captions.length === 0 && !withHookOverlay && fadeDuration === 0) {
+          cmd.audioCodec("copy");
+        } else {
+          const audioBitrate = determineAudioBitrate(metadata, qualityProfile.audioQuality);
+          cmd.audioCodec("aac").audioBitrate(audioBitrate);
+        }
+      }
     }
 
     cmd
@@ -475,32 +626,183 @@ function computeGcd(a: number, b: number): number {
   return b === 0 ? a : computeGcd(b, a % b);
 }
 
+// ─── Quality Profile Builder ──────────────────────────────────────────────────
+
+interface QualityProfile {
+  targetWidth?: number;
+  targetHeight?: number;
+  targetFps: number | "source";
+  codec: "h264" | "h265";
+  crf: number;
+  preset: string;
+  preserveHDR: boolean;
+  audioQuality?: "source" | "high" | "balanced" | "low";
+}
+
+function buildQualityProfile(
+  mode: string,
+  aspectRatio: string,
+  resolution: string,
+  options: RenderClipOptions,
+  metadata?: VideoMetadata
+): QualityProfile {
+  // Start with defaults
+  const profile: QualityProfile = {
+    targetFps: "source",
+    codec: options.codec || "h264",
+    crf: options.crf || 18, // High quality default
+    preset: options.preset || "medium",
+    preserveHDR: options.preserveHDR ?? false,
+    audioQuality: "high",
+  };
+
+  if (mode === "source-preserving") {
+    // Preserve source dimensions and frame rate
+    if (aspectRatio === "source" && metadata) {
+      profile.targetWidth = metadata.width;
+      profile.targetHeight = metadata.height;
+      profile.targetFps = metadata.fps;
+    } else {
+      // User wants specific aspect ratio but preserve quality
+      const dims = getOutputDimensions(aspectRatio, "source", metadata);
+      profile.targetWidth = dims.width;
+      profile.targetHeight = dims.height;
+      profile.targetFps = metadata?.fps || "source";
+    }
+    profile.crf = 16; // Highest quality for source-preserving
+    profile.preserveHDR = metadata?.hasHDR ?? false;
+    profile.audioQuality = "source";
+  } else if (mode === "vertical-social") {
+    // Platform-optimized vertical
+    const dims = getOutputDimensions("9:16", resolution, metadata);
+    profile.targetWidth = dims.width;
+    profile.targetHeight = dims.height;
+    profile.targetFps = options.fps || 30; // Most platforms prefer 30fps
+    profile.crf = 18; // High quality for social
+    profile.audioQuality = "high";
+  } else {
+    // Custom mode
+    const dims = getOutputDimensions(aspectRatio, resolution, metadata);
+    profile.targetWidth = dims.width;
+    profile.targetHeight = dims.height;
+    profile.targetFps = options.fps || metadata?.fps || 30;
+  }
+
+  return profile;
+}
+
 function getOutputDimensions(
   aspectRatio: string,
-  resolution: string
+  resolution: string,
+  metadata?: VideoMetadata
 ): { width: number; height: number } {
+  // Source-preserving mode
+  if (resolution === "source" && metadata) {
+    if (aspectRatio === "source") {
+      return { width: metadata.width, height: metadata.height };
+    }
+    // Use source resolution but adjust for requested aspect ratio
+    if (aspectRatio === "16:9") {
+      return { width: metadata.width, height: Math.round(metadata.width * 9 / 16) };
+    }
+    if (aspectRatio === "9:16") {
+      return { width: Math.round(metadata.height * 9 / 16), height: metadata.height };
+    }
+    if (aspectRatio === "1:1") {
+      const size = Math.min(metadata.width, metadata.height);
+      return { width: size, height: size };
+    }
+    if (aspectRatio === "4:5") {
+      return { width: Math.round(metadata.height * 4 / 5), height: metadata.height };
+    }
+  }
+
+  // Standard resolution mappings
   const resMap: Record<string, { width: number; height: number }> = {
     "720p": { width: 720, height: 1280 },
     "1080p": { width: 1080, height: 1920 },
-    "source": { width: 1080, height: 1920 },
+    "1440p": { width: 1440, height: 2560 },
+    "2160p": { width: 2160, height: 3840 },
   };
 
   const baseRes = resMap[resolution] ?? { width: 1080, height: 1920 };
 
   if (aspectRatio === "9:16") return baseRes;
   if (aspectRatio === "16:9") {
-    const h = resolution === "720p" ? 720 : 1080;
+    const h = baseRes.width; // Use the vertical dimension as horizontal for landscape
     return { width: Math.round(h * 16 / 9), height: h };
   }
   if (aspectRatio === "1:1") {
-    const s = resolution === "720p" ? 720 : 1080;
+    const s = baseRes.width;
     return { width: s, height: s };
   }
   if (aspectRatio === "4:5") {
-    const w = resolution === "720p" ? 720 : 1080;
+    const w = baseRes.width;
     return { width: w, height: Math.round(w * 5 / 4) };
   }
   return baseRes;
+}
+
+function buildScaleFilters(
+  targetW: number,
+  targetH: number,
+  aspectRatio: string,
+  metadata?: VideoMetadata
+): string[] {
+  const filters: string[] = [];
+
+  // Check if we're upscaling (warn but allow if explicitly requested)
+  if (metadata && (targetW > metadata.width || targetH > metadata.height)) {
+    console.warn(
+      `[renderClip] Warning: Upscaling from ${metadata.width}x${metadata.height} to ${targetW}x${targetH}. ` +
+      `This does not restore missing detail.`
+    );
+  }
+
+  // Apply crop if changing aspect ratio
+  if (aspectRatio !== "source") {
+    filters.push(buildCropFilter(targetW, targetH, aspectRatio));
+  }
+
+  // Scale to target dimensions
+  filters.push(`scale=${targetW}:${targetH}:force_original_aspect_ratio=decrease`);
+  filters.push(`pad=${targetW}:${targetH}:(ow-iw)/2:(oh-ih)/2:black`);
+
+  return filters;
+}
+
+function buildVerticalSocialFilters(
+  targetW: number,
+  targetH: number,
+  metadata?: VideoMetadata,
+  sourceWidth?: number
+): string[] {
+  const filters: string[] = [];
+
+  // Intelligent reframing for vertical social
+  // Strategy: Center crop from 16:9 to 9:16, preserving maximum detail
+  
+  if (metadata && metadata.width && metadata.height) {
+    const sourceAspect = metadata.width / metadata.height;
+    const targetAspect = targetW / targetH;
+
+    if (sourceAspect > targetAspect) {
+      // Source is wider - need to crop horizontally (typical 16:9 to 9:16)
+      // Crop from center, preserving vertical information
+      filters.push(`crop=ih*${targetW}/${targetH}:ih:(iw-ih*${targetW}/${targetH})/2:0`);
+    } else if (sourceAspect < targetAspect) {
+      // Source is taller - crop vertically
+      filters.push(`crop=iw:iw*${targetH}/${targetW}:0:(ih-iw*${targetH}/${targetW})/2`);
+    }
+  } else {
+    // Fallback: assume 16:9 source
+    filters.push(`crop=ih*9/16:ih:(iw-ih*9/16)/2:0`);
+  }
+
+  // Scale to exact target
+  filters.push(`scale=${targetW}:${targetH}:flags=lanczos`);
+
+  return filters;
 }
 
 function buildCropFilter(
@@ -518,8 +820,111 @@ function buildCropFilter(
   if (aspectRatio === "4:5") {
     return `crop=ih*4/5:ih:(iw-ih*4/5)/2:0`;
   }
-  // 16:9 — keep as is
+  // 16:9 — crop from center
   return `crop=iw:iw*9/16:0:(ih-iw*9/16)/2`;
+}
+
+function determineAudioBitrate(metadata: VideoMetadata, quality?: string): string {
+  if (quality === "source" && metadata.audioBitrate > 0) {
+    // Use source bitrate (capped at reasonable maximum)
+    return `${Math.min(320, Math.round(metadata.audioBitrate / 1000))}k`;
+  }
+  if (quality === "high") return "192k";
+  if (quality === "low") return "96k";
+  return "128k"; // balanced default
+}
+
+// ─── Quality Validation ───────────────────────────────────────────────────────
+
+export async function validateOutputQuality(
+  sourcePath: string,
+  outputPath: string,
+  expectedProfile: {
+    width?: number;
+    height?: number;
+    fps?: number;
+    preserveAspectRatio?: boolean;
+  }
+): Promise<{
+  passed: boolean;
+  report: string;
+  warnings: string[];
+  errors: string[];
+  sourceMetadata: VideoMetadata;
+  outputMetadata: VideoMetadata;
+}> {
+  const warnings: string[] = [];
+  const errors: string[] = [];
+
+  try {
+    const sourceMetadata = await inspectVideo(sourcePath);
+    const outputMetadata = await inspectVideo(outputPath);
+
+    // Dimension check
+    if (expectedProfile.width && outputMetadata.width !== expectedProfile.width) {
+      errors.push(
+        `Width mismatch: expected ${expectedProfile.width}, got ${outputMetadata.width}`
+      );
+    }
+    if (expectedProfile.height && outputMetadata.height !== expectedProfile.height) {
+      errors.push(
+        `Height mismatch: expected ${expectedProfile.height}, got ${outputMetadata.height}`
+      );
+    }
+
+    // Frame rate check
+    if (expectedProfile.fps && Math.abs(outputMetadata.fps - expectedProfile.fps) > 0.5) {
+      warnings.push(
+        `Frame rate variance: expected ${expectedProfile.fps}, got ${outputMetadata.fps}`
+      );
+    }
+
+    // Audio check
+    if (sourceMetadata.hasAudio && !outputMetadata.hasAudio) {
+      errors.push("Audio stream missing in output");
+    }
+
+    // Duration check (allow small variance for encoding)
+    const durationDiff = Math.abs(sourceMetadata.duration - outputMetadata.duration);
+    if (durationDiff > 1.0) {
+      warnings.push(
+        `Duration variance: source ${sourceMetadata.duration}s, output ${outputMetadata.duration}s`
+      );
+    }
+
+    // Quality assessment
+    let quality: "excellent" | "good" | "degraded" | "failed" = "excellent";
+    if (errors.length > 0) quality = "failed";
+    else if (warnings.length > 2) quality = "degraded";
+    else if (warnings.length > 0) quality = "good";
+
+    const report = `
+SOURCE: ${sourceMetadata.width}x${sourceMetadata.height} @ ${sourceMetadata.fps}fps, ${sourceMetadata.codec}
+OUTPUT: ${outputMetadata.width}x${outputMetadata.height} @ ${outputMetadata.fps}fps, ${outputMetadata.codec}
+QUALITY: ${quality.toUpperCase()}
+WARNINGS: ${warnings.length}
+ERRORS: ${errors.length}
+    `.trim();
+
+    return {
+      passed: errors.length === 0,
+      report,
+      warnings,
+      errors,
+      sourceMetadata,
+      outputMetadata,
+    };
+  } catch (err) {
+    errors.push(`Validation failed: ${err}`);
+    return {
+      passed: false,
+      report: `Validation error: ${err}`,
+      warnings,
+      errors,
+      sourceMetadata: {} as VideoMetadata,
+      outputMetadata: {} as VideoMetadata,
+    };
+  }
 }
 
 // ─── File Management ──────────────────────────────────────────────────────────

@@ -37,6 +37,24 @@ export interface VideoMetadata {
   format: string;
   aspectRatio: string;
   hasAudio: boolean;
+  // Enhanced metadata for quality preservation
+  displayAspectRatio?: string;
+  sampleAspectRatio?: string;
+  pixelFormat?: string;
+  bitDepth?: number;
+  codecProfile?: string;
+  codecLevel?: string;
+  avgFrameRate?: string;
+  rFrameRate?: string;
+  isVariableFrameRate?: boolean;
+  rotation?: number;
+  colorPrimaries?: string;
+  colorTransfer?: string;
+  colorSpace?: string;
+  hasHDR?: boolean;
+  audioSampleRate?: number;
+  timeBase?: string;
+  streamMetadata?: Record<string, any>;
 }
 
 // ─── Transcript ───────────────────────────────────────────────────────────────
@@ -400,6 +418,47 @@ export interface ClipRenderJob {
   startedAt?: string;
   completedAt?: string;
   fileSizeBytes?: number;
+}
+
+// ─── Quality Modes ────────────────────────────────────────────────────────────
+
+export type QualityMode = 
+  | "source-preserving"      // Preserve native source quality (default for clips)
+  | "vertical-social"        // Platform-ready vertical with intelligent reframing
+  | "custom";                // User-defined settings
+
+export interface QualityProfile {
+  mode: QualityMode;
+  targetWidth?: number;      // undefined = use source
+  targetHeight?: number;     // undefined = use source
+  targetFps?: number;        // undefined = use source
+  codec?: "h264" | "h265" | "av1";
+  crf?: number;              // Quality factor (lower = better, 16-18 recommended)
+  preset?: "ultrafast" | "fast" | "medium" | "slow" | "veryslow";
+  preserveHDR?: boolean;
+  audioQuality?: "source" | "high" | "balanced" | "low";
+  allowUpscaling?: boolean;  // Default false
+  reframeStrategy?: "crop" | "track" | "blur-background" | "split-screen";
+}
+
+export interface QualityValidationReport {
+  passed: boolean;
+  sourceMetadata: VideoMetadata;
+  outputMetadata?: VideoMetadata;
+  expectedDimensions: { width: number; height: number };
+  actualDimensions: { width: number; height: number };
+  expectedFps: number;
+  actualFps: number;
+  dimensionMatch: boolean;
+  fpsMatch: boolean;
+  aspectRatioMatch: boolean;
+  audioPresent: boolean;
+  audioSyncValid: boolean;
+  hadLossyReencode: boolean;
+  quality: "excellent" | "good" | "degraded" | "failed";
+  warnings: string[];
+  errors: string[];
+  report: string;
 }
 
 // ─── Clipper Configuration ────────────────────────────────────────────────────

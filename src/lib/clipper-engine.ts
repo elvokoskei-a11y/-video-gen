@@ -23,6 +23,7 @@ import {
   PLATFORM_PROFILES,
 } from "./clipper-config";
 import { AIProviderRouter } from "./providers/provider-router";
+import { ProviderOrchestrator, type ProviderConfig } from "./providers/provider-orchestrator";
 import {
   inspectVideo,
   extractAudio,
@@ -54,12 +55,21 @@ export interface StartAnalysisOptions {
 
 export class ClipperEngine {
   private router: AIProviderRouter;
+  private orchestrator?: ProviderOrchestrator;
   private transcriptionProvider: GeminiTranscriptionProvider | null;
   private config: ClipperConfig;
 
   constructor() {
     const geminiKey = process.env.GEMINI_API_KEY;
     const nvidiaKey = process.env.NVIDIA_API_KEY;
+    const primaryProvider = (process.env.AI_PRIMARY_PROVIDER || "gemini") as "gemini" | "nvidia" | "deepseek";
+    const fallbackProvider = (process.env.AI_FALLBACK_PROVIDER || "nvidia") as "gemini" | "nvidia" | "deepseek" | undefined;
+    const autoFailover = process.env.AI_AUTO_FAILOVER !== "false";
+    const maxRetries = parseInt(process.env.AI_MAX_RETRIES || "2");
+    const timeoutMs = parseInt(process.env.AI_PROVIDER_TIMEOUT_MS || "60000");
+    const nvidiaBaseUrl = process.env.NVIDIA_BASE_URL || "https://integrate.api.nvidia.com/v1";
+    const nvidiaModel = process.env.NVIDIA_MODEL || "deepseek-ai/deepseek-r1";
+    const geminiModel = process.env.GEMINI_MODEL;
 
     this.config = {
       ...DEFAULT_CLIPPER_CONFIG,
@@ -69,6 +79,49 @@ export class ClipperEngine {
         nvidiaKey ? "nvidia" : "gemini",
     };
 
+    // Build provider configs for orchestrator
+    const providerConfigs: ProviderConfig[] = [];
+    
+    if (geminiKey) {
+      providerConfigs.push({
+        type: "gemini",
+        apiKey: geminiKey,
+        model: geminiModel,
+        enabled: true,
+      });
+    }
+
+    if (nvidiaKey) {
+      providerConfigs.push({
+        type: "deepseek",
+        apiKey: nvidiaKey,
+        model: nvidiaModel,
+        baseUrl: nvidiaBaseUrl,
+        enabled: true,
+      });
+    }
+
+    // Initialize orchestrator if we have at least one provider
+    if (providerConfigs.length > 0) {
+      try {
+        this.orchestrator = new ProviderOrchestrator({
+          primaryProvider: primaryProvider === "nvidia" ? "deepseek" : primaryProvider,
+          fallbackProvider: fallbackProvider === "nvidia" ? "deepseek" : fallbackProvider,
+          providers: providerConfigs,
+          maxRetries,
+          timeoutMs,
+          autoFailover,
+        });
+        
+        console.log(
+          `[ClipperEngine] Orchestrator initialized: primary=${primaryProvider}, fallback=${fallbackProvider ?? "none"}, autoFailover=${autoFailover}`
+        );
+      } catch (err) {
+        console.error("[ClipperEngine] Orchestrator initialization failed:", err);
+      }
+    }
+
+    // Keep legacy router for backward compatibility
     this.router = new AIProviderRouter({
       mode: this.config.aiProviderMode,
       geminiApiKey: geminiKey,
@@ -85,7 +138,11 @@ export class ClipperEngine {
       console.warn(
         "[ClipperEngine] No AI provider configured. " +
         "Analysis will run in DEGRADED MODE using heuristic fallbacks. " +
-        "Set GEMINI_API_KEY to enable real AI analysis."
+        "Set GEMINI_API_KEY or NVIDIA_API_KEY to enable real AI analysis."
+      );
+    } else if (this.orchestrator) {
+      console.log(
+        "[ClipperEngine] Automatic failover enabled. Primary provider will automatically switch to fallback on quota/timeout/errors."
       );
     }
   }
@@ -261,7 +318,7 @@ export class ClipperEngine {
         if (s) { s.transcript = transcript; await SESSION_REPO.save(s); }
       }
 
-      // ── STAGE 4: First-Pass AI Analysis ──────────────────────────────────
+      // ── STAGE 4: First-Pass AI Analysis ──────────────────────────────────────
       await update("first_pass_analysis", 30,
         hasRealAI ? "Analyzing video content..." : "Building structure (DEGRADED MODE)...",
         hasRealAI ? "Running first-pass AI analysis" : "No AI configured — using heuristics"
@@ -270,14 +327,35 @@ export class ClipperEngine {
       let structure: VideoStructure;
       if (hasRealAI) {
         try {
-          const analysisResult = await this.router.analyzeVideo({
-            filePath: options.filePath,
-            transcript,
-            accountProfile: options.accountProfile,
-            targetPlatforms: options.targetPlatforms ?? [config.defaultPlatform],
-            sessionId,
-          });
-          structure = analysisResult.merged;
+          // Use orchestrator if available (with automatic failover)
+          if (this.orchestrator) {
+            await appendLog("first_pass", "Using orchestrator with automatic failover", false, "orchestrator");
+            const analysisResult = await this.orchestrator.analyzeVideo({
+              filePath: options.filePath,
+              transcript,
+              accountProfile: options.accountProfile,
+              targetPlatforms: options.targetPlatforms ?? [config.defaultPlatform],
+              sessionId,
+            });
+            structure = analysisResult.structure;
+            
+            // Log orchestrator metrics
+            const metrics = this.orchestrator.getMetrics();
+            if (metrics.failoverCount > 0) {
+              await appendLog("first_pass", `Failover occurred: ${metrics.lastFailover?.provider} → fallback (reason: ${metrics.lastFailover?.reason})`, false, "orchestrator");
+            }
+          } else {
+            // Fallback to legacy router
+            const analysisResult = await this.router.analyzeVideo({
+              filePath: options.filePath,
+              transcript,
+              accountProfile: options.accountProfile,
+              targetPlatforms: options.targetPlatforms ?? [config.defaultPlatform],
+              sessionId,
+            });
+            structure = analysisResult.merged;
+          }
+          
           await appendLog("first_pass", `AI analysis complete. Topics: ${structure.mainTopics.join(", ")}`, false, "router");
         } catch (err) {
           await appendLog("first_pass", `AI analysis failed: ${err}. Falling back to heuristics.`, true);
@@ -341,15 +419,35 @@ export class ClipperEngine {
 
       if (hasRealAI) {
         try {
-          const result = await this.router.identifyMoments({
-            transcript, structure, research,
-            accountProfile: options.accountProfile,
-            targetPlatforms: options.targetPlatforms ?? [config.defaultPlatform],
-            minDuration: config.minClipDuration,
-            maxDuration: config.maxClipDuration,
-            targetCount: config.defaultClipCount,
-          });
-          rawCandidates = result.combined as any;
+          // Use orchestrator with failover
+          if (this.orchestrator) {
+            const result = await this.orchestrator.identifyMoments({
+              transcript, structure, research,
+              accountProfile: options.accountProfile,
+              targetPlatforms: options.targetPlatforms ?? [config.defaultPlatform],
+              minDuration: config.minClipDuration,
+              maxDuration: config.maxClipDuration,
+              targetCount: config.defaultClipCount,
+            });
+            rawCandidates = result.moments as any;
+            
+            // Log failover if it occurred
+            const metrics = this.orchestrator.getMetrics();
+            if (metrics.failoverCount > 0 && metrics.lastFailover) {
+              await appendLog("candidates", `Provider failover: ${metrics.lastFailover.reason}`, false, "orchestrator");
+            }
+          } else {
+            const result = await this.router.identifyMoments({
+              transcript, structure, research,
+              accountProfile: options.accountProfile,
+              targetPlatforms: options.targetPlatforms ?? [config.defaultPlatform],
+              minDuration: config.minClipDuration,
+              maxDuration: config.maxClipDuration,
+              targetCount: config.defaultClipCount,
+            });
+            rawCandidates = result.combined as any;
+          }
+          
           await appendLog("candidates", `Found ${rawCandidates.length} AI candidates`, false, "router");
         } catch (err) {
           await appendLog("candidates", `Candidate detection failed: ${err}. Using heuristic.`, true);
@@ -389,17 +487,30 @@ export class ClipperEngine {
 
         if (hasRealAI) {
           try {
-            const result = await this.router.scoreMoment({
-              moment: raw as Partial<CandidateMoment>,
-              transcript, structure, research,
-              accountProfile: options.accountProfile,
-              targetPlatforms: options.targetPlatforms ?? [config.defaultPlatform],
-              scoringProfile,
-            });
-            scoreResult = result.merged;
-            geminiScore = result.primary?.score.overall;
-            nvidiaScore = result.secondary?.score.overall;
-            disagreementReport = result.disagreement;
+            // Use orchestrator with automatic failover
+            if (this.orchestrator) {
+              scoreResult = await this.orchestrator.scoreMoment({
+                moment: raw as Partial<CandidateMoment>,
+                transcript, structure, research,
+                accountProfile: options.accountProfile,
+                targetPlatforms: options.targetPlatforms ?? [config.defaultPlatform],
+                scoringProfile,
+              });
+              geminiScore = scoreResult.score.overall;
+              disagreementReport = { hasMeaningfulDisagreement: false, agreementPercent: 100, mainDisagreements: [], interpretation: "Single provider scoring" };
+            } else {
+              const result = await this.router.scoreMoment({
+                moment: raw as Partial<CandidateMoment>,
+                transcript, structure, research,
+                accountProfile: options.accountProfile,
+                targetPlatforms: options.targetPlatforms ?? [config.defaultPlatform],
+                scoringProfile,
+              });
+              scoreResult = result.merged;
+              geminiScore = result.primary?.score.overall;
+              nvidiaScore = result.secondary?.score.overall;
+              disagreementReport = result.disagreement;
+            }
           } catch (err) {
             await appendLog("scoring", `Scoring failed for candidate ${i}: ${err}`, true);
             scoreResult = buildHeuristicScore(raw, scoringProfile);
@@ -567,6 +678,14 @@ export class ClipperEngine {
 
   get availableProviders(): string[] {
     return this.router.availableProviders;
+  }
+
+  getOrchestratorMetrics() {
+    return this.orchestrator?.getMetrics();
+  }
+
+  getOrchestratorHistory() {
+    return this.orchestrator?.getFailoverHistory();
   }
 }
 

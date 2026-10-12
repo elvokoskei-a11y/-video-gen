@@ -488,6 +488,12 @@ export function parseKeyConfiguration(): KeyConfig[] {
 
   // Primary key (backward compatibility)
   const primaryKey = process.env.GEMINI_API_KEY;
+  console.log("[GeminiKeyManager] Checking GEMINI_API_KEY:", {
+    found: !!primaryKey,
+    length: primaryKey?.length || 0,
+    preview: primaryKey ? `${primaryKey.slice(0, 10)}...${primaryKey.slice(-4)}` : "not set"
+  });
+  
   if (primaryKey) {
     configs.push({
       key: primaryKey,
@@ -498,10 +504,21 @@ export function parseKeyConfiguration(): KeyConfig[] {
 
   // Additional keys from GEMINI_API_KEYS
   const keysEnv = process.env.GEMINI_API_KEYS;
+  console.log("[GeminiKeyManager] Checking GEMINI_API_KEYS:", {
+    found: !!keysEnv,
+    length: keysEnv?.length || 0,
+    rawPreview: keysEnv ? keysEnv.slice(0, 100) : "not set"
+  });
+  
   if (keysEnv) {
     try {
       // Try parsing as JSON array
       const parsed = JSON.parse(keysEnv);
+      console.log("[GeminiKeyManager] Parsed GEMINI_API_KEYS as JSON:", {
+        isArray: Array.isArray(parsed),
+        length: Array.isArray(parsed) ? parsed.length : 0
+      });
+      
       if (Array.isArray(parsed)) {
         for (let i = 0; i < parsed.length; i++) {
           const item = parsed[i];
@@ -520,10 +537,14 @@ export function parseKeyConfiguration(): KeyConfig[] {
             });
           }
         }
+        console.log(`[GeminiKeyManager] Added ${parsed.length} keys from GEMINI_API_KEYS`);
       }
-    } catch {
+    } catch (err) {
+      console.log("[GeminiKeyManager] GEMINI_API_KEYS is not valid JSON, trying comma-separated");
       // Not JSON, try comma-separated
       const keys = keysEnv.split(",").map(k => k.trim()).filter(k => k.length > 0);
+      console.log(`[GeminiKeyManager] Found ${keys.length} comma-separated keys`);
+      
       for (let i = 0; i < keys.length; i++) {
         configs.push({
           key: keys[i],
@@ -534,6 +555,7 @@ export function parseKeyConfiguration(): KeyConfig[] {
     }
   }
 
+  console.log(`[GeminiKeyManager] Total keys configured: ${configs.length}`);
   return configs;
 }
 
@@ -541,11 +563,15 @@ export function createKeyManager(options?: {
   dailyRequestLimit?: number;
   concurrentLimit?: number;
 }): GeminiKeyManager | null {
+  console.log("[GeminiKeyManager] Creating key manager...");
   const configs = parseKeyConfiguration();
   
   if (configs.length === 0) {
+    console.log("[GeminiKeyManager] ❌ No API keys found - key manager will not be created");
+    console.log("[GeminiKeyManager] Hint: Set GEMINI_API_KEY or GEMINI_API_KEYS in your environment");
     return null;
   }
 
+  console.log(`[GeminiKeyManager] ✅ Creating manager with ${configs.length} key(s)`);
   return new GeminiKeyManager(configs, options);
 }

@@ -64,6 +64,7 @@ export class ClipperEngine {
 
   constructor() {
     const geminiKey = process.env.GEMINI_API_KEY;
+    const geminiKeys = process.env.GEMINI_API_KEYS;
     const nvidiaKey = process.env.NVIDIA_API_KEY;
     const primaryProvider = (process.env.AI_PRIMARY_PROVIDER || "gemini") as "gemini" | "nvidia" | "deepseek";
     const fallbackProvider = (process.env.AI_FALLBACK_PROVIDER || "nvidia") as "gemini" | "nvidia" | "deepseek" | undefined;
@@ -73,6 +74,15 @@ export class ClipperEngine {
     const nvidiaBaseUrl = process.env.NVIDIA_BASE_URL || "https://integrate.api.nvidia.com/v1";
     const nvidiaModel = process.env.NVIDIA_MODEL || "deepseek-ai/deepseek-r1";
     const geminiModel = process.env.GEMINI_MODEL;
+
+    // Log what we found (without exposing keys)
+    console.log("[ClipperEngine] Environment check:", {
+      hasGeminiKey: !!geminiKey,
+      hasGeminiKeys: !!geminiKeys,
+      hasNvidiaKey: !!nvidiaKey,
+      geminiKeyLength: geminiKey?.length || 0,
+      geminiKeysLength: geminiKeys?.length || 0,
+    });
 
     // Initialize Gemini key manager (supports multiple keys for capacity)
     const dailyRequestLimit = parseInt(process.env.GEMINI_DAILY_REQUEST_LIMIT || "0") || Infinity;
@@ -87,6 +97,8 @@ export class ClipperEngine {
       console.log(
         `[ClipperEngine] Gemini key pool initialized: ${this.keyManager.totalKeys} keys, ${dailyRequestLimit === Infinity ? "unlimited" : dailyRequestLimit} daily requests`
       );
+    } else {
+      console.log("[ClipperEngine] No Gemini key manager - checking for single key");
     }
 
     this.config = {
@@ -132,11 +144,13 @@ export class ClipperEngine {
         });
         
         console.log(
-          `[ClipperEngine] Orchestrator initialized: primary=${primaryProvider}, fallback=${fallbackProvider ?? "none"}, autoFailover=${autoFailover}`
+          `[ClipperEngine] ✅ Orchestrator initialized: primary=${primaryProvider}, fallback=${fallbackProvider ?? "none"}, autoFailover=${autoFailover}`
         );
       } catch (err) {
-        console.error("[ClipperEngine] Orchestrator initialization failed:", err);
+        console.error("[ClipperEngine] ❌ Orchestrator initialization failed:", err);
       }
+    } else {
+      console.log("[ClipperEngine] ⚠️  No provider configs available - will run in degraded mode");
     }
 
     // Keep legacy router for backward compatibility
@@ -961,10 +975,28 @@ function extractSignals(reasoning: string): string[] {
 // One engine instance shared across API routes
 
 let engineInstance: ClipperEngine | null = null;
+let lastEnvCheck: { gemini: string | undefined; nvidia: string | undefined; geminiKeys: string | undefined } | null = null;
 
 export function getClipperEngine(): ClipperEngine {
-  if (!engineInstance) {
+  // Check if environment variables have changed
+  const currentEnv = {
+    gemini: process.env.GEMINI_API_KEY,
+    nvidia: process.env.NVIDIA_API_KEY,
+    geminiKeys: process.env.GEMINI_API_KEYS,
+  };
+
+  // Reinitialize if environment has changed or first run
+  if (
+    !engineInstance ||
+    !lastEnvCheck ||
+    lastEnvCheck.gemini !== currentEnv.gemini ||
+    lastEnvCheck.nvidia !== currentEnv.nvidia ||
+    lastEnvCheck.geminiKeys !== currentEnv.geminiKeys
+  ) {
+    console.log("[ClipperEngine] Initializing with current environment variables");
     engineInstance = new ClipperEngine();
+    lastEnvCheck = currentEnv;
   }
+
   return engineInstance;
 }

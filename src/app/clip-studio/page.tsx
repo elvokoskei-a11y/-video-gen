@@ -368,6 +368,20 @@ export default function ClipStudioPage() {
     if (!file) return;
 
     setAnalysisError(null);
+
+    // Check file size BEFORE uploading
+    // Vercel Hobby plan has 4.5MB body size limit
+    const VERCEL_LIMIT = 4.5 * 1024 * 1024; // 4.5MB
+    const fileSizeMB = file.size / 1024 / 1024;
+    
+    if (file.size > VERCEL_LIMIT) {
+      setAnalysisError(
+        `File too large: ${fileSizeMB.toFixed(2)}MB. Vercel Hobby plan has a 4.5MB upload limit. ` +
+        `Please use a smaller video (compress it or trim it first) or upgrade to Vercel Pro for 10MB uploads.`
+      );
+      return;
+    }
+
     setStage("analyzing");
 
     // Create object URL for local video playback
@@ -573,7 +587,7 @@ export default function ClipStudioPage() {
                 {isDragging ? "Drop to upload" : "Drag & drop your video here"}
               </p>
               <p className="text-[12px] text-[#6F737A]">or click to browse</p>
-              <p className="text-[11px] text-[#6F737A]/70 mt-3">MP4 · MOV · AVI · MKV · WebM · Up to 10GB</p>
+              <p className="text-[11px] text-[#6F737A]/70 mt-3">MP4 · MOV · AVI · MKV · WebM · Max 4.5MB (Vercel limit)</p>
             </div>
 
             {analysisError && (

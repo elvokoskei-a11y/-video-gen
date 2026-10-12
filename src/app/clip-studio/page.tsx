@@ -55,9 +55,6 @@ export default function ClipStudioPage() {
   }>({ geminiConfigured: false, nvidiaConfigured: false, aiMode: "unknown", checked: false });
 
   useEffect(() => {
-    // First, optimistically check if we can detect keys client-side (won't work in production but helps in dev)
-    const hasAnyKey = typeof window !== 'undefined';
-    
     fetch("/api/system/providers")
       .then((r) => r.json())
       .then((data) => {
@@ -80,17 +77,16 @@ export default function ClipStudioPage() {
           checked: true,
         });
         
-        // Log for debugging
+        // Log for debugging (only log primitives, not objects)
         console.log("[ClipStudio] Provider status:", { 
-          gemini, 
-          nvidia, 
-          geminiConfigured,
           geminiStatus: gemini?.status,
-          geminiNote: gemini?.note 
+          geminiNote: gemini?.note,
+          nvidiaStatus: nvidia?.status,
+          geminiConfigured,
         });
       })
       .catch((err) => {
-        console.error("[ClipStudio] Failed to fetch provider status:", err);
+        console.error("[ClipStudio] Failed to fetch provider status:", err?.message || "Unknown error");
         // On error, assume configured (fail open) - better UX than showing false warning
         setAiStatus((s) => ({ ...s, geminiConfigured: true, checked: true }));
       });

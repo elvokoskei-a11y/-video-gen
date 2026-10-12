@@ -69,16 +69,47 @@ export async function checkSystemHealth(): Promise<SystemHealth> {
 
 async function checkGemini(): Promise<ProviderHealth> {
   const key = process.env.GEMINI_API_KEY;
+  const keysEnv = process.env.GEMINI_API_KEYS;
   const model = process.env.GEMINI_MODEL ?? "gemini-1.5-pro";
   const checkedAt = new Date().toISOString();
 
-  if (!key) {
+  // Check if any Gemini configuration exists
+  if (!key && !keysEnv) {
     return {
       name: "Gemini",
       type: "ai",
       status: "not_configured",
       model,
-      note: "GEMINI_API_KEY not set. AI analysis unavailable.",
+      note: "GEMINI_API_KEY or GEMINI_API_KEYS not set. AI analysis unavailable.",
+      checkedAt,
+    };
+  }
+
+  // Try to get a test key (either single key or first from pool)
+  let testKey = key;
+  if (!testKey && keysEnv) {
+    try {
+      // Parse the GEMINI_API_KEYS to get a test key
+      let parsed = JSON.parse(keysEnv);
+      if (Array.isArray(parsed) && parsed.length > 0) {
+        testKey = typeof parsed[0] === 'string' ? parsed[0] : parsed[0]?.key;
+      }
+    } catch {
+      // Try comma-separated
+      const keys = keysEnv.split(',').map(k => k.trim()).filter(k => k.length > 0);
+      if (keys.length > 0) {
+        testKey = keys[0];
+      }
+    }
+  }
+
+  if (!testKey) {
+    return {
+      name: "Gemini",
+      type: "ai",
+      status: "error",
+      model,
+      note: "GEMINI_API_KEYS configured but no valid keys found. Check JSON format.",
       checkedAt,
     };
   }
@@ -87,13 +118,15 @@ async function checkGemini(): Promise<ProviderHealth> {
   try {
     // Lightweight test — list models endpoint
     const res = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models?key=${key}`,
+      `https://generativelanguage.googleapis.com/v1beta/models?key=${testKey}`,
       { signal: AbortSignal.timeout(5000) }
     );
     const latencyMs = Date.now() - start;
 
     if (res.ok) {
-      return { name: "Gemini", type: "ai", status: "connected", latencyMs, model, checkedAt };
+      // Add note about key pool if using multiple keys
+      const note = keysEnv ? "Key pool configured" : undefined;
+      return { name: "Gemini", type: "ai", status: "connected", latencyMs, model, note, checkedAt };
     } else if (res.status === 400 || res.status === 403) {
       return { name: "Gemini", type: "ai", status: "error", latencyMs, model, note: `Auth error (${res.status})`, checkedAt };
     } else {
@@ -333,7 +366,7 @@ async function checkWorker(): Promise<ProviderHealth> {
 }
 
 export function determineAIMode(): string {
-  const hasGemini = !!process.env.GEMINI_API_KEY;
+  const hasGemini = !!(process.env.GEMINI_API_KEY || process.env.GEMINI_API_KEYS);
   const hasNvidia = !!process.env.NVIDIA_API_KEY;
   const nvidiaModel = process.env.NVIDIA_MODEL ?? "";
   const isDeepSeek = nvidiaModel.includes("deepseek");
@@ -356,11 +389,11 @@ export function determineAIMode(): string {
 }
 
 export function isAIConfigured(): boolean {
-  return !!(process.env.GEMINI_API_KEY || process.env.NVIDIA_API_KEY);
+  return !!(process.env.GEMINI_API_KEY || process.env.GEMINI_API_KEYS || process.env.NVIDIA_API_KEY);
 }
 
 export function isGeminiConfigured(): boolean {
-  return !!process.env.GEMINI_API_KEY;
+  return !!(process.env.GEMINI_API_KEY || process.env.GEMINI_API_KEYS);
 }
 
 export function isNvidiaConfigured(): boolean {

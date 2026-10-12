@@ -584,7 +584,7 @@ export default function ClipStudioPage() {
             )}
 
             {/* AI provider status banner */}
-            {aiStatus.checked && !aiStatus.geminiConfigured && (
+            {aiStatus.checked && !aiStatus.geminiConfigured && false && ( // DISABLED - Debug keys not being injected
               <div className="mt-4 flex items-start gap-2 p-3 rounded-lg bg-[#1C0A00] border border-[#B45309]/30 text-[12px]">
                 <AlertTriangle size={13} className="mt-0.5 text-[#B45309] flex-shrink-0" />
                 <div className="flex-1">
@@ -596,6 +596,20 @@ export default function ClipStudioPage() {
                   <p className="text-[#6F737A] mt-1 text-[11px]">
                     Set your key in <code className="text-[#A6A8AD] bg-[#1A1C20] px-1 rounded">.env.local</code> for development, or in your Vercel environment for production.
                   </p>
+                </div>
+              </div>
+            )}
+            {/* DEBUG: Show what we detected */}
+            {aiStatus.checked && (
+              <div className="mt-4 p-3 rounded-lg bg-[#0A0A0A] border border-[#292C31] text-[11px] font-mono">
+                <div className="flex items-center gap-2 mb-2">
+                  <Info size={12} className="text-[#6F737A]" />
+                  <span className="text-[#A6A8AD] font-semibold">Environment Check</span>
+                </div>
+                <div className="space-y-1 text-[#6F737A]">
+                  <div>Gemini: <span className={aiStatus.geminiConfigured ? "text-[#059669]" : "text-[#9F1239]"}>{aiStatus.geminiConfigured ? "Configured" : "Not detected"}</span></div>
+                  <div>NVIDIA: <span className={aiStatus.nvidiaConfigured ? "text-[#059669]" : "text-[#6F737A]"}>{aiStatus.nvidiaConfigured ? "Configured" : "Not configured"}</span></div>
+                  <div className="text-[10px] mt-2">Check <code className="text-[#A6A8AD]">/api/debug/env-check</code> for details</div>
                 </div>
               </div>
             )}

@@ -73,8 +73,27 @@ async function checkGemini(): Promise<ProviderHealth> {
   const model = process.env.GEMINI_MODEL ?? "gemini-1.5-pro";
   const checkedAt = new Date().toISOString();
 
+  // DEBUG: Log ALL environment variables related to Gemini
+  console.log("[checkGemini] Environment check:", {
+    GEMINI_API_KEY_exists: !!key,
+    GEMINI_API_KEY_length: key?.length || 0,
+    GEMINI_API_KEYS_exists: !!keysEnv,
+    GEMINI_API_KEYS_length: keysEnv?.length || 0,
+    NODE_ENV: process.env.NODE_ENV,
+  });
+
+  // Check for numbered keys
+  let numberedKeysFound = 0;
+  for (let i = 1; i <= 10; i++) {
+    if (process.env[`GEMINI_API_KEY${i}`]) {
+      numberedKeysFound++;
+    }
+  }
+  console.log(`[checkGemini] Numbered keys found: ${numberedKeysFound}`);
+
   // Check if any Gemini configuration exists
-  if (!key && !keysEnv) {
+  if (!key && !keysEnv && numberedKeysFound === 0) {
+    console.log("[checkGemini] NO KEYS FOUND - returning not_configured");
     return {
       name: "Gemini",
       type: "ai",
@@ -84,6 +103,8 @@ async function checkGemini(): Promise<ProviderHealth> {
       checkedAt,
     };
   }
+
+  console.log("[checkGemini] Keys found, attempting to get test key...");
 
   // Try to get a test key (either single key or first from pool)
   let testKey = key;
@@ -103,7 +124,20 @@ async function checkGemini(): Promise<ProviderHealth> {
     }
   }
 
+  // Check numbered keys if still no test key
+  if (!testKey && numberedKeysFound > 0) {
+    for (let i = 1; i <= 10; i++) {
+      const numberedKey = process.env[`GEMINI_API_KEY${i}`];
+      if (numberedKey) {
+        testKey = numberedKey;
+        console.log(`[checkGemini] Using GEMINI_API_KEY${i} for test`);
+        break;
+      }
+    }
+  }
+
   if (!testKey) {
+    console.log("[checkGemini] Keys configured but no valid test key extracted");
     return {
       name: "Gemini",
       type: "ai",
@@ -113,6 +147,8 @@ async function checkGemini(): Promise<ProviderHealth> {
       checkedAt,
     };
   }
+
+  console.log(`[checkGemini] Test key found (length: ${testKey.length}), testing connection...`);
 
   const start = Date.now();
   try {

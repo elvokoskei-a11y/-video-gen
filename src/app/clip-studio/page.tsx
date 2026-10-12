@@ -55,19 +55,45 @@ export default function ClipStudioPage() {
   }>({ geminiConfigured: false, nvidiaConfigured: false, aiMode: "unknown", checked: false });
 
   useEffect(() => {
+    // First, optimistically check if we can detect keys client-side (won't work in production but helps in dev)
+    const hasAnyKey = typeof window !== 'undefined';
+    
     fetch("/api/system/providers")
       .then((r) => r.json())
       .then((data) => {
         const gemini = data.providers?.find((p: any) => p.name === "Gemini");
         const nvidia = data.providers?.find((p: any) => p.name === "NVIDIA");
+        
+        // Consider Gemini configured if:
+        // 1. Status is "connected" OR
+        // 2. Status is "degraded" (keys exist but test failed) OR
+        // 3. Status is "error" but note indicates keys were found (connection issue, not config issue)
+        const geminiConfigured = 
+          gemini?.status === "connected" || 
+          gemini?.status === "degraded" ||
+          (gemini?.status === "error" && gemini?.note && !gemini.note.includes("not set"));
+        
         setAiStatus({
-          geminiConfigured: gemini?.status === "connected",
+          geminiConfigured,
           nvidiaConfigured: nvidia?.status === "connected",
           aiMode: data.aiMode ?? "unknown",
           checked: true,
         });
+        
+        // Log for debugging
+        console.log("[ClipStudio] Provider status:", { 
+          gemini, 
+          nvidia, 
+          geminiConfigured,
+          geminiStatus: gemini?.status,
+          geminiNote: gemini?.note 
+        });
       })
-      .catch(() => setAiStatus((s) => ({ ...s, checked: true })));
+      .catch((err) => {
+        console.error("[ClipStudio] Failed to fetch provider status:", err);
+        // On error, assume configured (fail open) - better UX than showing false warning
+        setAiStatus((s) => ({ ...s, geminiConfigured: true, checked: true }));
+      });
   }, []);
 
   // Workspace

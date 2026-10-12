@@ -116,10 +116,10 @@ async function checkGemini(): Promise<ProviderHealth> {
 
   const start = Date.now();
   try {
-    // Lightweight test — list models endpoint
+    // Lightweight test — list models endpoint with shorter timeout
     const res = await fetch(
       `https://generativelanguage.googleapis.com/v1beta/models?key=${testKey}`,
-      { signal: AbortSignal.timeout(5000) }
+      { signal: AbortSignal.timeout(3000) } // Reduced from 5000ms to 3000ms
     );
     const latencyMs = Date.now() - start;
 
@@ -133,10 +133,26 @@ async function checkGemini(): Promise<ProviderHealth> {
       return { name: "Gemini", type: "ai", status: "degraded", latencyMs, model, note: `HTTP ${res.status}`, checkedAt };
     }
   } catch (err: any) {
+    const latencyMs = Date.now() - start;
+    // If it's just a timeout, mark as degraded (not "not_configured")
+    // The key exists, we just can't test it right now
+    if (err?.name === "TimeoutError" || err?.name === "AbortError") {
+      return {
+        name: "Gemini",
+        type: "ai",
+        status: "degraded",
+        latencyMs,
+        model,
+        note: "Connection timeout (key is configured but test failed)",
+        checkedAt,
+      };
+    }
+    
     return {
       name: "Gemini",
       type: "ai",
       status: "error",
+      latencyMs,
       model,
       note: err?.name === "TimeoutError" ? "Connection timeout" : `Connection failed: ${err?.message?.slice(0, 80)}`,
       checkedAt,

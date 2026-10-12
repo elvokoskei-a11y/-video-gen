@@ -177,7 +177,7 @@ export function ExactTimestampPanel({
               />
             </div>
             <p className="text-[10px] text-[#6F737A] mt-1 pl-5">
-              Formats: MM:SS, seconds, or "1m 24s"
+              Formats: MM:SS, seconds, or &quot;1m 24s&quot;
             </p>
           </div>
 

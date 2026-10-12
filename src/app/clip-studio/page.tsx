@@ -148,7 +148,7 @@ export default function ClipStudioPage() {
     videoRef.current.currentTime = seekTo;
     setCurrentTime(seekTo);
     if (videoDuration > 0) setPlayhead(seekTo / videoDuration);
-  }, [selectedCandidateId]);
+  }, [selectedCandidateId, selectedCandidate, videoDuration]);
 
   // Volume sync
   useEffect(() => {
@@ -242,62 +242,12 @@ export default function ClipStudioPage() {
     } catch { /* ignore */ }
   }, []);
 
-  // ─── Upload ───────────────────────────────────────────────────────────────
-
-  const handleFileUpload = useCallback(async (file: File) => {
-    if (!file) return;
-
-    setAnalysisError(null);
-    setStage("analyzing");
-
-    // Create object URL for local video playback
-    const objectUrl = URL.createObjectURL(file);
-
-    try {
-      // Upload file to server
-      const formData = new FormData();
-      formData.append("file", file);
-
-      const uploadRes = await fetch("/api/clips/upload", { method: "POST", body: formData });
-      const uploadData = await uploadRes.json();
-
-      if (!uploadRes.ok || uploadData.error) {
-        throw new Error(uploadData.error ?? "Upload failed");
-      }
-
-      setUploadedFile({ path: uploadData.filePath, name: file.name, size: file.size, objectUrl });
-
-      // Start analysis
-      const analyzeRes = await fetch("/api/clips/analyze", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          filePath: uploadData.filePath,
-          fileName: file.name,
-          accountId: selectedAccountId,
-          targetPlatforms: ["youtube_shorts", "tiktok", "instagram"],
-          scoringProfileId: "balanced",
-        }),
-      });
-
-      const analyzeData = await analyzeRes.json();
-      if (!analyzeRes.ok || analyzeData.error) {
-        throw new Error(analyzeData.error ?? "Analysis failed to start");
-      }
-
-      setSessionId(analyzeData.sessionId);
-      startPolling(analyzeData.sessionId);
-    } catch (err) {
-      URL.revokeObjectURL(objectUrl);
-      setAnalysisError(err instanceof Error ? err.message : String(err));
-      setStage("upload");
-    }
-  }, [selectedAccountId]);
+  // ─── Start Polling ────────────────────────────────────────────────────────
 
   const startPolling = useCallback((sid: string) => {
     if (pollingRef.current) clearInterval(pollingRef.current);
 
-    pollingRef.current = setInterval(async () => {
+    const pollSession = async () => {
       try {
         const statusRes = await fetch(`/api/clips/status/${sid}`);
         const statusData = await statusRes.json();
@@ -384,8 +334,63 @@ export default function ClipStudioPage() {
       } catch (err) {
         console.error("[polling]", err);
       }
-    }, 2000);
+    };
+
+    pollSession(); // Initial call
+    pollingRef.current = setInterval(pollSession, 2000);
   }, [loadWaveform]);
+
+  // ─── Upload ───────────────────────────────────────────────────────────────
+
+  const handleFileUpload = useCallback(async (file: File) => {
+    if (!file) return;
+
+    setAnalysisError(null);
+    setStage("analyzing");
+
+    // Create object URL for local video playback
+    const objectUrl = URL.createObjectURL(file);
+
+    try {
+      // Upload file to server
+      const formData = new FormData();
+      formData.append("file", file);
+
+      const uploadRes = await fetch("/api/clips/upload", { method: "POST", body: formData });
+      const uploadData = await uploadRes.json();
+
+      if (!uploadRes.ok || uploadData.error) {
+        throw new Error(uploadData.error ?? "Upload failed");
+      }
+
+      setUploadedFile({ path: uploadData.filePath, name: file.name, size: file.size, objectUrl });
+
+      // Start analysis
+      const analyzeRes = await fetch("/api/clips/analyze", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          filePath: uploadData.filePath,
+          fileName: file.name,
+          accountId: selectedAccountId,
+          targetPlatforms: ["youtube_shorts", "tiktok", "instagram"],
+          scoringProfileId: "balanced",
+        }),
+      });
+
+      const analyzeData = await analyzeRes.json();
+      if (!analyzeRes.ok || analyzeData.error) {
+        throw new Error(analyzeData.error ?? "Analysis failed to start");
+      }
+
+      setSessionId(analyzeData.sessionId);
+      startPolling(analyzeData.sessionId);
+    } catch (err) {
+      URL.revokeObjectURL(objectUrl);
+      setAnalysisError(err instanceof Error ? err.message : String(err));
+      setStage("upload");
+    }
+  }, [selectedAccountId, startPolling]);
 
   // Cleanup on unmount
   useEffect(() => {
@@ -393,7 +398,7 @@ export default function ClipStudioPage() {
       if (pollingRef.current) clearInterval(pollingRef.current);
       if (uploadedFile?.objectUrl) URL.revokeObjectURL(uploadedFile.objectUrl);
     };
-  }, []);
+  }, [uploadedFile?.objectUrl]);
 
   // ─── Approve / Reject ──────────────────────────────────────────────────────
 

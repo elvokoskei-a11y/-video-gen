@@ -120,7 +120,7 @@ export function MomentSearchPanel({
     "Clip the funniest unexpected reaction",
     "Find where he says the most controversial thing",
     "Find the moment where she reveals the surprising truth",
-    "Find the exact moment when he says 'I knew this would happen'",
+    "Find the exact moment when he says &apos;I knew this would happen&apos;",
     "Find the section where they give three practical tips",
   ];
 
@@ -134,7 +134,7 @@ export function MomentSearchPanel({
           </div>
           <div>
             <h3 className="text-[13px] font-semibold text-[#F3F1EC]">Find My Exact Moment</h3>
-            <p className="text-[10px] text-[#6F737A]">Describe what you're looking for</p>
+            <p className="text-[10px] text-[#6F737A]">Describe what you&apos;re looking for</p>
           </div>
         </div>
         {onClose && (
@@ -298,7 +298,7 @@ export function MomentSearchPanel({
                       {/* Excerpt */}
                       {candidate.transcriptExcerpt && (
                         <p className="text-[10px] text-[#6F737A] italic leading-relaxed mb-2">
-                          "{candidate.transcriptExcerpt.slice(0, 150)}{candidate.transcriptExcerpt.length > 150 ? "..." : ""}"
+                          &quot;{candidate.transcriptExcerpt.slice(0, 150)}{candidate.transcriptExcerpt.length > 150 ? '...' : ''}&quot;
                         </p>
                       )}
 

@@ -58,7 +58,7 @@ export function CommandPalette() {
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [commandPaletteOpen, filtered, selectedIndex]);
+  }, [commandPaletteOpen, filtered, selectedIndex, router, setCommandPaletteOpen]);
 
   if (!commandPaletteOpen) return null;
 

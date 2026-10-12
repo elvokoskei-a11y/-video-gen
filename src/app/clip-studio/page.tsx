@@ -100,6 +100,13 @@ export default function ClipStudioPage() {
   const [renderUrl, setRenderUrl] = useState<string | null>(null);
   const [withCaptions, setWithCaptions] = useState(true);
   const [withHookOverlay, setWithHookOverlay] = useState(false);
+  
+  // CTA settings
+  const [ctaEnabled, setCtaEnabled] = useState(true); // Enabled by default
+  const [ctaText, setCtaText] = useState("Enjoyed this? Like, share & follow for more.");
+  const [ctaDuration, setCtaDuration] = useState<2 | 2.5 | 3>(2.5);
+  const [ctaStyle, setCtaStyle] = useState<"minimal_overlay" | "clean_endcard">("minimal_overlay");
+  const [showCtaSettings, setShowCtaSettings] = useState(false);
 
   const selectedCandidate = session?.candidates.find((c) => c.id === selectedCandidateId) ?? null;
   const videoDuration = session?.metadata?.duration ?? 0;
@@ -460,6 +467,10 @@ export default function ClipStudioPage() {
           withHookOverlay,
           startTime: clipStart,
           endTime: clipEnd,
+          ctaEnabled,
+          ctaText,
+          ctaDuration,
+          ctaStyle,
         }),
       });
 
@@ -477,7 +488,7 @@ export default function ClipStudioPage() {
     } finally {
       setIsRendering(false);
     }
-  }, [sessionId, selectedCandidateId, selectedCandidate, selectedRatio, withCaptions, withHookOverlay, editStart, editEnd, handleApprove]);
+  }, [sessionId, selectedCandidateId, selectedCandidate, selectedRatio, withCaptions, withHookOverlay, editStart, editEnd, handleApprove, ctaEnabled, ctaText, ctaDuration, ctaStyle]);
 
   // ─── Drag & Drop ──────────────────────────────────────────────────────────
 
@@ -975,6 +986,33 @@ export default function ClipStudioPage() {
                   )} />
                 </button>
               </label>
+              <label className="flex items-center gap-1.5 cursor-pointer">
+                <span className="text-[10px] text-[#6F737A]">End CTA</span>
+                <button
+                  onClick={() => setCtaEnabled(!ctaEnabled)}
+                  className={cn(
+                    "relative w-7 h-4 rounded-full transition-colors border",
+                    ctaEnabled ? "bg-[#059669] border-[#047857]" : "bg-[#1A1C20] border-[#292C31]"
+                  )}
+                >
+                  <span className={cn(
+                    "absolute top-0.5 w-3 h-3 rounded-full bg-white transition-transform",
+                    ctaEnabled ? "left-3.5" : "left-0.5"
+                  )} />
+                </button>
+                {ctaEnabled && (
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setShowCtaSettings(!showCtaSettings);
+                    }}
+                    className="text-[#6F737A] hover:text-[#A6A8AD] transition-colors"
+                    title="CTA Settings"
+                  >
+                    <Wand2 size={11} />
+                  </button>
+                )}
+              </label>
 
               {selectedCandidate && editStart !== null && (
                 <div className="ml-auto flex items-center gap-2">
@@ -990,6 +1028,96 @@ export default function ClipStudioPage() {
                 </div>
               )}
             </div>
+
+            {/* CTA Settings Panel (collapsible) */}
+            {showCtaSettings && ctaEnabled && (
+              <div className="border-t border-[#292C31] bg-[#0D0E10] px-3 py-3 flex-shrink-0 space-y-3">
+                <div className="flex items-center justify-between mb-2">
+                  <span className="text-[11px] font-semibold text-[#F3F1EC]">CTA Settings</span>
+                  <button
+                    onClick={() => setShowCtaSettings(false)}
+                    className="text-[#6F737A] hover:text-[#A6A8AD]"
+                  >
+                    <X size={12} />
+                  </button>
+                </div>
+
+                {/* CTA Text */}
+                <div>
+                  <label className="text-[10px] text-[#6F737A] mb-1 block">Text</label>
+                  <input
+                    type="text"
+                    value={ctaText}
+                    onChange={(e) => setCtaText(e.target.value)}
+                    placeholder="Enjoyed this? Like, share &amp; follow for more."
+                    className="w-full px-2 py-1.5 text-[11px] bg-[#141518] border border-[#292C31] rounded text-[#F3F1EC] focus:border-[#059669] focus:outline-none"
+                    maxLength={80}
+                  />
+                  <p className="text-[9px] text-[#6F737A] mt-0.5">Keep it short and natural</p>
+                </div>
+
+                {/* Duration */}
+                <div>
+                  <label className="text-[10px] text-[#6F737A] mb-1.5 block">Duration</label>
+                  <div className="flex gap-2">
+                    {([2, 2.5, 3] as const).map((d) => (
+                      <button
+                        key={d}
+                        onClick={() => setCtaDuration(d)}
+                        className={cn(
+                          "flex-1 px-2 py-1.5 text-[10px] rounded border transition-colors",
+                          ctaDuration === d
+                            ? "bg-[#022C22] border-[#059669] text-[#059669]"
+                            : "bg-[#141518] border-[#292C31] text-[#6F737A] hover:border-[#3C3F46]"
+                        )}
+                      >
+                        {d}s
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Style */}
+                <div>
+                  <label className="text-[10px] text-[#6F737A] mb-1.5 block">Style</label>
+                  <div className="flex gap-2">
+                    <button
+                      onClick={() => setCtaStyle("minimal_overlay")}
+                      className={cn(
+                        "flex-1 px-2 py-1.5 text-[10px] rounded border transition-colors text-left",
+                        ctaStyle === "minimal_overlay"
+                          ? "bg-[#022C22] border-[#059669] text-[#059669]"
+                          : "bg-[#141518] border-[#292C31] text-[#6F737A] hover:border-[#3C3F46]"
+                      )}
+                    >
+                      <div className="font-medium">Minimal Overlay</div>
+                      <div className="text-[9px] opacity-70">Subtle fade-in/out</div>
+                    </button>
+                    <button
+                      onClick={() => setCtaStyle("clean_endcard")}
+                      className={cn(
+                        "flex-1 px-2 py-1.5 text-[10px] rounded border transition-colors text-left",
+                        ctaStyle === "clean_endcard"
+                          ? "bg-[#022C22] border-[#059669] text-[#059669]"
+                          : "bg-[#141518] border-[#292C31] text-[#6F737A] hover:border-[#3C3F46]"
+                      )}
+                    >
+                      <div className="font-medium">Clean Endcard</div>
+                      <div className="text-[9px] opacity-70">With background</div>
+                    </button>
+                  </div>
+                </div>
+
+                {/* Preview info */}
+                <div className="rounded bg-[#022C22]/30 border border-[#059669]/20 p-2">
+                  <p className="text-[9px] text-[#059669] leading-relaxed">
+                    <Info size={10} className="inline mr-1" />
+                    CTA will appear in the last {ctaDuration}s of your clip. Position optimized for {selectedRatio} format.
+                  </p>
+                </div>
+              </div>
+            )}
+
           </div>
 
           {/* RIGHT: Intelligence panel */}
@@ -1208,7 +1336,7 @@ function WhyPanel({ candidate }: { candidate: CandidateMoment }) {
               <span className="text-[9px] text-[#B45309]">⚠ Editorial overlay (generated)</span>
             )}
           </div>
-          <p className="text-[12px] text-[#F3F1EC] italic">"{candidate.hook.text}"</p>
+          <p className="text-[12px] text-[#F3F1EC] italic">&ldquo;{candidate.hook.text}&rdquo;</p>
         </div>
       </div>
 

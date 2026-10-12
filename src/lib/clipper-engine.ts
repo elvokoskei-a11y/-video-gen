@@ -24,6 +24,8 @@ import {
 } from "./clipper-config";
 import { AIProviderRouter } from "./providers/provider-router";
 import { ProviderOrchestrator, type ProviderConfig } from "./providers/provider-orchestrator";
+import { createKeyManager, type GeminiKeyManager } from "./providers/gemini-key-manager";
+import { GeminiProvider } from "./providers/gemini-provider";
 import {
   inspectVideo,
   extractAudio,
@@ -57,6 +59,7 @@ export class ClipperEngine {
   private router: AIProviderRouter;
   private orchestrator?: ProviderOrchestrator;
   private transcriptionProvider: GeminiTranscriptionProvider | null;
+  private keyManager: GeminiKeyManager | null;
   private config: ClipperConfig;
 
   constructor() {
@@ -71,21 +74,36 @@ export class ClipperEngine {
     const nvidiaModel = process.env.NVIDIA_MODEL || "deepseek-ai/deepseek-r1";
     const geminiModel = process.env.GEMINI_MODEL;
 
+    // Initialize Gemini key manager (supports multiple keys for capacity)
+    const dailyRequestLimit = parseInt(process.env.GEMINI_DAILY_REQUEST_LIMIT || "0") || Infinity;
+    const concurrentLimit = parseInt(process.env.GEMINI_CONCURRENT_LIMIT || "10");
+    
+    this.keyManager = createKeyManager({
+      dailyRequestLimit,
+      concurrentLimit,
+    });
+
+    if (this.keyManager) {
+      console.log(
+        `[ClipperEngine] Gemini key pool initialized: ${this.keyManager.totalKeys} keys, ${dailyRequestLimit === Infinity ? "unlimited" : dailyRequestLimit} daily requests`
+      );
+    }
+
     this.config = {
       ...DEFAULT_CLIPPER_CONFIG,
       aiProviderMode:
-        geminiKey && nvidiaKey ? "both" :
-        geminiKey ? "gemini" :
+        (geminiKey || this.keyManager) && nvidiaKey ? "both" :
+        (geminiKey || this.keyManager) ? "gemini" :
         nvidiaKey ? "nvidia" : "gemini",
     };
 
     // Build provider configs for orchestrator
     const providerConfigs: ProviderConfig[] = [];
     
-    if (geminiKey) {
+    if (geminiKey || this.keyManager) {
       providerConfigs.push({
         type: "gemini",
-        apiKey: geminiKey,
+        apiKey: geminiKey || "pooled", // Use "pooled" as placeholder when using key manager
         model: geminiModel,
         enabled: true,
       });
@@ -130,19 +148,27 @@ export class ClipperEngine {
       nvidiaModel: process.env.NVIDIA_MODEL ?? this.config.nvidiaModel,
     });
 
-    this.transcriptionProvider = geminiKey
-      ? new GeminiTranscriptionProvider(geminiKey)
-      : null;
+    // Transcription provider - use key manager if available
+    if (this.keyManager) {
+      this.transcriptionProvider = new GeminiTranscriptionProvider(this.keyManager as any);
+    } else if (geminiKey) {
+      this.transcriptionProvider = new GeminiTranscriptionProvider(geminiKey);
+    } else {
+      this.transcriptionProvider = null;
+    }
 
-    if (!isAIConfigured()) {
+    if (!isAIConfigured() && !this.keyManager) {
       console.warn(
         "[ClipperEngine] No AI provider configured. " +
         "Analysis will run in DEGRADED MODE using heuristic fallbacks. " +
         "Set GEMINI_API_KEY or NVIDIA_API_KEY to enable real AI analysis."
       );
-    } else if (this.orchestrator) {
+    } else if (this.orchestrator || this.keyManager) {
+      const capacityMsg = this.keyManager 
+        ? ` (Gemini pool: ${this.keyManager.totalKeys} keys)` 
+        : "";
       console.log(
-        "[ClipperEngine] Automatic failover enabled. Primary provider will automatically switch to fallback on quota/timeout/errors."
+        `[ClipperEngine] Automatic failover enabled${capacityMsg}. Primary provider will automatically switch to fallback on quota/timeout/errors.`
       );
     }
   }

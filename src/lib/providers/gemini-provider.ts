@@ -11,18 +11,21 @@ import type {
   GenerateHookParams,
   SearchContextParams,
   ExplainScoreParams,
+  SearchMomentParams,
   VideoAnalysisResult,
   TranscriptAnalysisResult,
   MomentIdentificationResult,
   MomentScoreResult,
   HookResult,
   ResearchResult,
+  MomentSearchResult,
   VideoStructure,
   CandidateScore,
   HookAnalysis,
   ClipBoundary,
 } from "@/types/clipper";
 import { computeWeightedScore, PLATFORM_PROFILES } from "@/lib/clipper-config";
+import type { GeminiKeyManager } from "./gemini-key-manager";
 
 // ─── Gemini Provider ──────────────────────────────────────────────────────────
 // Responsibilities:
@@ -31,20 +34,112 @@ import { computeWeightedScore, PLATFORM_PROFILES } from "@/lib/clipper-config";
 //   • Google Search grounding for current context
 //   • Candidate moment discovery
 //   • Hook generation and scoring
+//
+// UPDATED: Now supports key pool management for increased capacity and reliability
 
 // Cache of uploaded file URIs so we don't re-upload the same video
 const fileUploadCache = new Map<string, { uri: string; mimeType: string }>();
 
 export class GeminiProvider implements VideoAnalysisProvider {
   name = "gemini" as const;
-  private client: GoogleGenerativeAI;
-  private fileManager: GoogleAIFileManager;
+  private keyManager: GeminiKeyManager | null;
+  private fallbackKey: string | null; // For backward compatibility
   private model: string;
 
-  constructor(apiKey: string, model = "gemini-1.5-pro") {
-    this.client = new GoogleGenerativeAI(apiKey);
-    this.fileManager = new GoogleAIFileManager(apiKey);
+  constructor(apiKeyOrManager: string | GeminiKeyManager, model = "gemini-1.5-pro") {
+    if (typeof apiKeyOrManager === "string") {
+      // Backward compatibility: single key mode
+      this.keyManager = null;
+      this.fallbackKey = apiKeyOrManager;
+    } else {
+      // Modern mode: key pool manager
+      this.keyManager = apiKeyOrManager;
+      this.fallbackKey = null;
+    }
     this.model = model;
+  }
+
+  // ─── Key Acquisition Helper ───────────────────────────────────────────────
+  // Acquires a key from the pool or uses the fallback single key
+
+  private async withKey<T>(
+    operation: (client: GoogleGenerativeAI, fileManager: GoogleAIFileManager) => Promise<T>,
+    operationName: string
+  ): Promise<T> {
+    if (this.fallbackKey) {
+      // Single key mode - no pool management
+      const client = new GoogleGenerativeAI(this.fallbackKey);
+      const fileManager = new GoogleAIFileManager(this.fallbackKey);
+      return operation(client, fileManager);
+    }
+
+    if (!this.keyManager) {
+      throw new Error("No Gemini API key or key manager configured");
+    }
+
+    // Acquire key from pool
+    const keyInfo = await this.keyManager.acquireKey();
+    if (!keyInfo) {
+      throw new Error("All Gemini API keys are exhausted or rate-limited");
+    }
+
+    const client = new GoogleGenerativeAI(keyInfo.key);
+    const fileManager = new GoogleAIFileManager(keyInfo.key);
+
+    try {
+      const result = await operation(client, fileManager);
+      
+      // Report success
+      this.keyManager.releaseKey(keyInfo.keyId, true);
+      
+      return result;
+    } catch (error: any) {
+      // Classify error and report to key manager
+      const errorType = this.classifyError(error);
+      const retryAfter = this.extractRetryAfter(error);
+
+      this.keyManager.releaseKey(keyInfo.keyId, false, {
+        type: errorType,
+        message: error.message || String(error),
+        retryAfter,
+      });
+
+      throw error;
+    }
+  }
+
+  // ─── Error Classification ─────────────────────────────────────────────────
+
+  private classifyError(error: any): "rate_limit" | "quota_exhausted" | "auth_error" | "billing_error" | "server_error" | "timeout" | "unknown" {
+    const message = String(error.message || error).toLowerCase();
+    
+    // Check for HTTP status codes
+    if (error.status) {
+      if (error.status === 429) return "rate_limit";
+      if (error.status === 403) {
+        if (message.includes("quota")) return "quota_exhausted";
+        if (message.includes("billing")) return "billing_error";
+        return "auth_error";
+      }
+      if (error.status === 401) return "auth_error";
+      if (error.status >= 500) return "server_error";
+    }
+
+    // Check message patterns
+    if (message.includes("rate limit") || message.includes("429")) return "rate_limit";
+    if (message.includes("quota") || message.includes("resource exhausted")) return "quota_exhausted";
+    if (message.includes("billing") || message.includes("payment")) return "billing_error";
+    if (message.includes("api key") || message.includes("unauthorized") || message.includes("forbidden")) return "auth_error";
+    if (message.includes("timeout") || message.includes("timed out")) return "timeout";
+    if (message.includes("500") || message.includes("502") || message.includes("503")) return "server_error";
+
+    return "unknown";
+  }
+
+  private extractRetryAfter(error: any): number | undefined {
+    const message = String(error.message || error);
+    const match = message.match(/retry.*?(\d+)\s*(?:second|sec)/i);
+    return match ? parseInt(match[1]) : undefined;
   }
 
   // ─── Upload Video to Gemini Files API ─────────────────────────────────────
@@ -72,40 +167,40 @@ export class GeminiProvider implements VideoAnalysisProvider {
 
     console.log(`[GeminiProvider] Uploading ${displayName} to Files API...`);
 
-    const uploadResponse = await this.fileManager.uploadFile(filePath, {
-      mimeType,
-      displayName,
-    });
+    return this.withKey(async (client, fileManager) => {
+      const uploadResponse = await fileManager.uploadFile(filePath, {
+        mimeType,
+        displayName,
+      });
 
-    const file = uploadResponse.file;
-    console.log(`[GeminiProvider] File uploaded: ${file.name}, state: ${file.state}`);
+      const file = uploadResponse.file;
+      console.log(`[GeminiProvider] File uploaded: ${file.name}, state: ${file.state}`);
 
-    // Wait for processing to complete
-    let attempts = 0;
-    while (file.state === FileState.PROCESSING && attempts < 60) {
-      await new Promise((resolve) => setTimeout(resolve, 5000)); // poll every 5s
-      const updatedFile = await this.fileManager.getFile(file.name);
-      (file as any).state = updatedFile.state;
-      (file as any).uri = updatedFile.uri;
-      attempts++;
-    }
+      // Wait for processing to complete
+      let attempts = 0;
+      while (file.state === FileState.PROCESSING && attempts < 60) {
+        await new Promise((resolve) => setTimeout(resolve, 5000)); // poll every 5s
+        const updatedFile = await fileManager.getFile(file.name);
+        (file as any).state = updatedFile.state;
+        (file as any).uri = updatedFile.uri;
+        attempts++;
+      }
 
-    if (file.state === FileState.FAILED) {
-      throw new Error(`Gemini Files API processing failed for ${displayName}`);
-    }
+      if (file.state === FileState.FAILED) {
+        throw new Error(`Gemini Files API processing failed for ${displayName}`);
+      }
 
-    const result = { uri: file.uri, mimeType };
-    fileUploadCache.set(filePath, result);
-    console.log(`[GeminiProvider] File ready: ${result.uri}`);
-    return result;
+      const result = { uri: file.uri, mimeType };
+      fileUploadCache.set(filePath, result);
+      console.log(`[GeminiProvider] File ready: ${result.uri}`);
+      return result;
+    }, "uploadVideoFile");
   }
 
   // ─── Video Analysis via File URI ───────────────────────────────────────────
 
   async analyzeVideo(params: AnalyzeVideoParams): Promise<VideoAnalysisResult> {
     const start = Date.now();
-
-    const model = this.client.getGenerativeModel({ model: this.model });
 
     const accountContext = params.accountProfile
       ? `Account: ${params.accountProfile.name}
@@ -196,7 +291,11 @@ Return your analysis as valid JSON matching this exact structure:
         parts.push({ text: `TRANSCRIPT:\n${transcriptText}\n\n${prompt}` });
       }
 
-      const result = await model.generateContent({ contents: [{ role: "user", parts }] });
+      const result = await this.withKey(async (client) => {
+        const model = client.getGenerativeModel({ model: this.model });
+        return model.generateContent({ contents: [{ role: "user", parts }] });
+      }, "analyzeVideo");
+
       rawResponse = result.response.text();
       tokensUsed = result.response.usageMetadata?.totalTokenCount ?? 0;
 
@@ -219,7 +318,6 @@ Return your analysis as valid JSON matching this exact structure:
 
   async analyzeTranscript(params: AnalyzeTranscriptParams): Promise<TranscriptAnalysisResult> {
     const start = Date.now();
-    const model = this.client.getGenerativeModel({ model: this.model });
 
     const transcriptText = params.transcript.segments
       .map((s) => `[${formatTime(s.startTime)}–${formatTime(s.endTime)}] ${s.speakerLabel}: ${s.text}`)
@@ -273,8 +371,11 @@ Return JSON:
 
     let structure: VideoStructure;
     try {
-      const result = await model.generateContent(prompt);
-      structure = parseJsonFromText<VideoStructure>(result.response.text());
+      structure = await this.withKey(async (client) => {
+        const model = client.getGenerativeModel({ model: this.model });
+        const result = await model.generateContent(prompt);
+        return parseJsonFromText<VideoStructure>(result.response.text());
+      }, "analyzeTranscript");
     } catch {
       structure = buildEmptyStructure();
     }
@@ -286,7 +387,6 @@ Return JSON:
 
   async identifyMoments(params: IdentifyMomentsParams): Promise<MomentIdentificationResult> {
     const start = Date.now();
-    const model = this.client.getGenerativeModel({ model: this.model });
 
     const transcriptText = params.transcript.segments
       .map((s) => `[${formatTime(s.startTime)}–${formatTime(s.endTime)}] ${s.speakerLabel}: ${s.text}`)
@@ -362,7 +462,11 @@ Return a JSON array:
     let tokensUsed = 0;
 
     try {
-      const result = await model.generateContent(prompt);
+      const result = await this.withKey(async (client) => {
+        const model = client.getGenerativeModel({ model: this.model });
+        return model.generateContent(prompt);
+      }, "identifyMoments");
+
       tokensUsed = result.response.usageMetadata?.totalTokenCount ?? 0;
       const parsed = parseJsonFromText<any[]>(result.response.text());
       if (Array.isArray(parsed)) {
@@ -390,8 +494,6 @@ Return a JSON array:
 
   async scoreMoment(params: ScoreMomentParams): Promise<MomentScoreResult> {
     const start = Date.now();
-    // Use Flash for scoring — cheaper and faster, still capable
-    const model = this.client.getGenerativeModel({ model: "gemini-1.5-flash" });
 
     const segment = params.transcript.segments.filter(
       (s) =>
@@ -501,7 +603,12 @@ Return JSON:
     let scoreResult: Partial<MomentScoreResult> = {};
 
     try {
-      const result = await model.generateContent(prompt);
+      const result = await this.withKey(async (client) => {
+        // Use Flash for scoring — cheaper and faster, still capable
+        const model = client.getGenerativeModel({ model: "gemini-1.5-flash" });
+        return model.generateContent(prompt);
+      }, "scoreMoment");
+
       const parsed = parseJsonFromText<any>(result.response.text());
 
       const rawScores = parsed.scores ?? {};
@@ -576,7 +683,6 @@ Return JSON:
 
   async generateHook(params: GenerateHookParams): Promise<HookResult> {
     const start = Date.now();
-    const model = this.client.getGenerativeModel({ model: "gemini-1.5-flash" });
 
     const segment = params.transcript.segments.filter(
       (s) =>
@@ -624,7 +730,11 @@ Return JSON:
 }`;
 
     try {
-      const result = await model.generateContent(prompt);
+      const result = await this.withKey(async (client) => {
+        const model = client.getGenerativeModel({ model: "gemini-1.5-flash" });
+        return model.generateContent(prompt);
+      }, "generateHook");
+
       const parsed = parseJsonFromText<any>(result.response.text());
 
       return {
@@ -656,31 +766,27 @@ Return JSON:
   async searchCurrentContext(params: SearchContextParams): Promise<ResearchResult> {
     const start = Date.now();
 
-    const model = this.client.getGenerativeModel({
-      model: "gemini-1.5-flash",
-      tools: [{ googleSearch: {} } as any],
-    });
-
     const topicsStr = params.topics.join(", ");
     const sessionId = `research_${Date.now()}`;
 
     // First: decide if research is even useful
-    const relevanceModel = this.client.getGenerativeModel({ model: "gemini-1.5-flash" });
-    
     let shouldSearch = false;
     let queries: string[] = [];
     let searchReason = "Not time-sensitive — search skipped";
 
     try {
-      const relevanceCheck = await relevanceModel.generateContent(
-        `A video is about these topics: ${topicsStr}
+      const relevanceCheck = await this.withKey(async (client) => {
+        const relevanceModel = client.getGenerativeModel({ model: "gemini-1.5-flash" });
+        return relevanceModel.generateContent(
+          `A video is about these topics: ${topicsStr}
 
 Is there meaningful value in searching for current information about these topics to help identify the most engaging clip moments?
 
 Consider: Is this time-sensitive? Would current trends, discussions, or terminology help identify what's most relevant right now?
 
 Return JSON: {"shouldSearch": true/false, "reason": "explanation", "queries": ["query1", "query2", "query3"]}`
-      );
+        );
+      }, "searchCurrentContext_relevance");
 
       const relevanceParsed = parseJsonFromText<any>(relevanceCheck.response.text());
       shouldSearch = relevanceParsed.shouldSearch === true;
@@ -725,7 +831,14 @@ Video content summary: ${params.videoContent.slice(0, 500)}
 
 Account context: ${params.accountProfile?.niche ?? "General content"}`;
 
-      const searchResult = await model.generateContent(searchPrompt);
+      const searchResult = await this.withKey(async (client) => {
+        const model = client.getGenerativeModel({
+          model: "gemini-1.5-flash",
+          tools: [{ googleSearch: {} } as any],
+        });
+        return model.generateContent(searchPrompt);
+      }, "searchCurrentContext_search");
+
       const groundingMetadata = (searchResult.response as any).candidates?.[0]?.groundingMetadata;
 
       // Extract sources from grounding metadata
@@ -749,14 +862,17 @@ Account context: ${params.accountProfile?.niche ?? "General content"}`;
 
       // Extract relevant terms and interest level from response
       try {
-        const parseModel = this.client.getGenerativeModel({ model: "gemini-1.5-flash" });
-        const termsParsed = await parseModel.generateContent(
-          `From this research summary, extract: 1) key relevant terms list, 2) interest level (very_high/high/medium/low/minimal).
-          
+        const termsParsed = await this.withKey(async (client) => {
+          const parseModel = client.getGenerativeModel({ model: "gemini-1.5-flash" });
+          return parseModel.generateContent(
+            `From this research summary, extract: 1) key relevant terms list, 2) interest level (very_high/high/medium/low/minimal).
+            
 Summary: ${contextSummary}
 
 Return JSON: {"terms": ["term1"], "interestLevel": "medium"}`
-        );
+          );
+        }, "searchCurrentContext_parse");
+
         const termsResult = parseJsonFromText<any>(termsParsed.response.text());
         relevantTerms = termsResult.terms ?? [];
         interestLevel = termsResult.interestLevel ?? "medium";
@@ -788,8 +904,6 @@ Return JSON: {"terms": ["term1"], "interestLevel": "medium"}`
   // ─── Explain Score ────────────────────────────────────────────────────────
 
   async explainScore(params: ExplainScoreParams): Promise<string> {
-    const model = this.client.getGenerativeModel({ model: "gemini-1.5-flash" });
-
     const prompt = `A video clip has been scored for short-form content potential.
 
 Clip: ${params.moment.summary}
@@ -806,10 +920,160 @@ Write a 2-3 sentence plain English explanation of WHY this clip scored the way i
 Be specific about what's in the content. Don't use jargon.`;
 
     try {
-      const result = await model.generateContent(prompt);
+      const result = await this.withKey(async (client) => {
+        const model = client.getGenerativeModel({ model: "gemini-1.5-flash" });
+        return model.generateContent(prompt);
+      }, "explainScore");
+      
       return result.response.text();
     } catch {
       return `This clip scored ${params.score.overall}/100 based on its content characteristics.`;
+    }
+  }
+
+  // ─── Natural Language Moment Search ───────────────────────────────────────
+  // Find specific moments matching a natural-language description
+
+  async searchMomentByDescription(params: SearchMomentParams): Promise<MomentSearchResult> {
+    const start = Date.now();
+
+    // Filter transcript to time range if specified
+    let relevantSegments = params.transcript.segments;
+    if (params.timeRangeStart !== undefined || params.timeRangeEnd !== undefined) {
+      relevantSegments = relevantSegments.filter(s => {
+        if (params.timeRangeStart !== undefined && s.endTime < params.timeRangeStart) return false;
+        if (params.timeRangeEnd !== undefined && s.startTime > params.timeRangeEnd) return false;
+        return true;
+      });
+    }
+
+    const transcriptText = relevantSegments
+      .map(s => `[${formatTime(s.startTime)}–${formatTime(s.endTime)}] ${s.speakerLabel}: ${s.text}`)
+      .join("\n");
+
+    const structureContext = params.structure ? `
+VIDEO CONTEXT:
+Topics: ${params.structure.mainTopics.join(", ")}
+Category: ${params.structure.contentCategory}
+Tone: ${params.structure.estimatedTone}
+Key Events: ${params.structure.keyEvents.map(e => `${formatTime(e.timestamp)}: ${e.description}`).join("; ")}
+` : "";
+
+    const timeRangeNote = (params.timeRangeStart !== undefined || params.timeRangeEnd !== undefined)
+      ? `\nSEARCH CONSTRAINED TO: ${formatTime(params.timeRangeStart ?? 0)} to ${formatTime(params.timeRangeEnd ?? params.transcript.duration)}`
+      : "";
+
+    const prompt = `You are an expert video editor searching for a specific moment in a video based on a user's description.
+
+USER'S DESCRIPTION:
+"${params.description}"
+${timeRangeNote}
+${structureContext}
+FULL TRANSCRIPT:
+${transcriptText}
+
+TASK: Find the ${params.maxCandidates ?? 5} best moments that match the user's description.
+
+CRITICAL RULES:
+1. The moment MUST actually exist in the transcript - never invent dialogue or events
+2. Use the EXACT timestamps from the transcript
+3. Include enough context (3-6 seconds before the key moment)
+4. If the description mentions specific words/phrases, find where they actually occur
+5. If no perfect match exists, find the closest alternatives and explain the difference
+6. Rate confidence honestly (0-100) based on how well it matches
+
+For each candidate, identify:
+- Exact start and end timestamps (include context before the moment)
+- Why this matches the description
+- Specific matching elements (quotes, reactions, topics, emotions)
+- How confident you are (0-100)
+- The hook or key phrase from this moment
+
+Return JSON:
+{
+  "candidates": [
+    {
+      "startTime": 0,
+      "endTime": 0,
+      "confidence": 0,
+      "description": "Why this matches",
+      "transcriptExcerpt": "Actual words from transcript",
+      "matchReasons": ["reason 1", "reason 2"],
+      "hookText": "Key phrase or opening"
+    }
+  ],
+  "searchStrategy": "How you searched and what you prioritized"
+}
+
+If NO moments match, return an empty candidates array and explain in searchStrategy why nothing matched.`;
+
+    try {
+      const result = await this.withKey(async (client) => {
+        const model = client.getGenerativeModel({ model: this.model });
+        return model.generateContent(prompt);
+      }, "searchMomentByDescription");
+
+      const parsed = parseJsonFromText<any>(result.response.text());
+      
+      const candidates: MomentSearchResult["candidates"] = (parsed.candidates || []).map((c: any) => ({
+        startTime: Number(c.startTime),
+        endTime: Number(c.endTime),
+        duration: Number(c.endTime) - Number(c.startTime),
+        confidence: Number(c.confidence ?? 70),
+        description: String(c.description || ""),
+        transcriptExcerpt: String(c.transcriptExcerpt || ""),
+        matchReasons: Array.isArray(c.matchReasons) ? c.matchReasons : [],
+        hookText: c.hookText,
+      }));
+
+      return {
+        sessionId: params.sessionId,
+        searchDescription: params.description,
+        candidates: candidates.sort((a, b) => b.confidence - a.confidence),
+        searchStrategy: parsed.searchStrategy || "AI-powered semantic search",
+        latencyMs: Date.now() - start,
+        provider: "gemini",
+      };
+
+    } catch (error) {
+      console.error("[GeminiProvider.searchMomentByDescription]", error);
+      
+      // Fallback: try simple keyword search
+      const keywords = params.description.toLowerCase().split(/\s+/).filter(w => w.length > 3);
+      const matches = relevantSegments.filter(s => 
+        keywords.some(kw => s.text.toLowerCase().includes(kw))
+      );
+
+      if (matches.length > 0) {
+        const candidates = matches.slice(0, params.maxCandidates ?? 5).map(s => ({
+          startTime: Math.max(0, s.startTime - 3),
+          endTime: s.endTime + 2,
+          duration: s.endTime - s.startTime + 5,
+          confidence: 50,
+          description: `Contains keywords from your search`,
+          transcriptExcerpt: s.text,
+          matchReasons: keywords.filter(kw => s.text.toLowerCase().includes(kw)),
+          hookText: s.text.slice(0, 50),
+        }));
+
+        return {
+          sessionId: params.sessionId,
+          searchDescription: params.description,
+          candidates,
+          searchStrategy: "Keyword fallback (AI unavailable)",
+          latencyMs: Date.now() - start,
+          provider: "gemini",
+        };
+      }
+
+      return {
+        sessionId: params.sessionId,
+        searchDescription: params.description,
+        candidates: [],
+        searchStrategy: `Search failed: ${error instanceof Error ? error.message : "Unknown error"}`,
+        latencyMs: Date.now() - start,
+        provider: "gemini",
+      };
     }
   }
 }

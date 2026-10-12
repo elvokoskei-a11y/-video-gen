@@ -5,6 +5,7 @@ import { renderClip, getClipOutputPath, CLIPS_DIR, validateOutputQuality } from 
 import { mkdir } from "fs/promises";
 import path from "path";
 import type { CaptionLine } from "@/lib/media/ffmpeg-service";
+import { DEFAULT_CTA_CONFIG, getCTAPresetForPlatform, type Platform } from "@/types/cta";
 
 export const runtime = "nodejs";
 export const maxDuration = 300;
@@ -26,6 +27,12 @@ export async function POST(request: NextRequest) {
       crf,
       preset,
       codec,
+      // CTA configuration
+      ctaEnabled,
+      ctaText,
+      ctaDuration,
+      ctaStyle,
+      platform,
     } = body;
 
     if (!sessionId || !candidateId) {
@@ -86,7 +93,36 @@ export async function POST(request: NextRequest) {
       ? candidate.hook.suggestedOverlay ?? candidate.hook.text
       : undefined;
 
+    // Build CTA configuration
+    const ctaConfig = (() => {
+      // Default to enabled with preset text if not explicitly disabled
+      const enabled = ctaEnabled !== false; // enabled by default
+      
+      if (!enabled) return undefined;
+
+      // Use provided text, or get preset for platform/aspect ratio
+      let text = ctaText;
+      if (!text) {
+        // Try to match platform from session or infer from aspect ratio
+        const platformKey = platform || 
+          (aspectRatio === "9:16" ? "tiktok" : 
+           aspectRatio === "16:9" ? "youtube_landscape" : "instagram");
+        const preset = getCTAPresetForPlatform(platformKey as Platform);
+        text = preset.text;
+      }
+
+      return {
+        enabled: true,
+        text,
+        duration: ctaDuration || DEFAULT_CTA_CONFIG.duration,
+        style: ctaStyle || DEFAULT_CTA_CONFIG.style,
+      };
+    })();
+
     console.log(`[Render] Starting ${qualityMode} mode render for ${sessionId}/${candidateId}`);
+    if (ctaConfig) {
+      console.log(`[Render] CTA: "${ctaConfig.text}" (${ctaConfig.duration}s, ${ctaConfig.style})`);
+    }
 
     // Render the clip with quality preservation
     const result = await renderClip({
@@ -106,6 +142,7 @@ export async function POST(request: NextRequest) {
       preset,
       codec: codec as any,
       sourceMetadata: session.metadata,
+      ctaConfig, // Pass CTA configuration
       onProgress: (pct) => {
         if (pct % 20 === 0) console.log(`[Render] ${pct}%`);
       },
@@ -146,6 +183,7 @@ export async function POST(request: NextRequest) {
       aspectRatio,
       resolution,
       withCaptions,
+      ctaIncluded: !!ctaConfig,
       qualityMode,
       validation: {
         passed: validation.passed,

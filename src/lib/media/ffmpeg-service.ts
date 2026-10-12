@@ -7,6 +7,7 @@ import fs from "fs";
 import os from "os";
 import type { VideoMetadata } from "@/types/clipper";
 import { getFontPath, getBoldFontPath, getFontRegistryStatus } from "./font-registry";
+import { computeCTAPosition } from "@/types/cta";
 
 // Set the ffmpeg + ffprobe binary paths
 // fluent-ffmpeg uses child_process.spawn (not exec/shell), so paths with
@@ -268,6 +269,14 @@ export interface RenderClipOptions {
   codec?: "h264" | "h265";
   preserveHDR?: boolean;
   sourceMetadata?: VideoMetadata;  // Pass in for quality-aware decisions
+  // CTA options
+  ctaConfig?: {
+    enabled: boolean;
+    text: string;
+    duration: number;
+    style: "minimal_overlay" | "clean_endcard";
+    position?: { x: string; y: string };
+  };
 }
 
 export interface CaptionLine {
@@ -297,9 +306,25 @@ export async function renderClip(options: RenderClipOptions): Promise<{
     onProgress,
     qualityMode = "source-preserving",
     sourceMetadata,
+    ctaConfig,
   } = options;
 
   const duration = endTime - startTime;
+  
+  // Validate CTA timing if enabled
+  let ctaDuration = 0;
+  let ctaStartTime = 0;
+  if (ctaConfig?.enabled && ctaConfig.text) {
+    ctaDuration = ctaConfig.duration || 2.5;
+    ctaStartTime = Math.max(0, duration - ctaDuration);
+    
+    // Ensure CTA doesn't dominate short clips
+    if (ctaDuration > duration * 0.25) {
+      console.warn(`[renderClip] CTA duration (${ctaDuration}s) > 25% of clip (${duration.toFixed(1)}s) - reducing to 2s`);
+      ctaDuration = 2;
+      ctaStartTime = Math.max(0, duration - ctaDuration);
+    }
+  }
 
   // Get or inspect source metadata
   let metadata = sourceMetadata;
@@ -417,6 +442,57 @@ export async function renderClip(options: RenderClipOptions): Promise<{
       `x=(w-text_w)/2:y=h*0.08:` +
       `enable='between(t,0,3)'`
     );
+  }
+
+  // CTA (Call-To-Action) overlay — professional end-of-video encouragement
+  if (ctaConfig?.enabled && ctaConfig.text && ctaDuration > 0) {
+    const tmpCTAFile = path.join(os.tmpdir(), `cta_${Date.now()}.txt`);
+    fs.writeFileSync(tmpCTAFile, ctaConfig.text, "utf8");
+    if (!options._captionTempFiles) options._captionTempFiles = [];
+    options._captionTempFiles.push(tmpCTAFile);
+
+    // Determine position based on aspect ratio if not provided
+    const ctaPos = ctaConfig.position || computeCTAPosition(aspectRatio);
+    
+    // Font size scaled based on aspect ratio
+    const ctaFontSize = 
+      aspectRatio === "9:16" || aspectRatio === "4:5" ? 28 :
+      aspectRatio === "1:1" ? 26 :
+      24; // landscape
+
+    // Style: minimal_overlay uses subtle fade-in/out with semi-transparent background
+    if (ctaConfig.style === "minimal_overlay") {
+      // CTA text with smooth fade-in and fade-out
+      // Fade in: 0.3s, visible for (duration - 0.6s), fade out: 0.3s
+      const fadeInEnd = ctaStartTime + 0.3;
+      const fadeOutStart = Math.max(fadeInEnd + 0.1, ctaStartTime + ctaDuration - 0.3);
+      
+      filters.push(
+        `drawtext=textfile='${tmpCTAFile}':` +
+        `fontfile='${captionFontPath}':` +
+        `fontsize=${ctaFontSize}:` +
+        `fontcolor=white:` +
+        `bordercolor=black@0.6:borderw=2:` +
+        `x=${ctaPos.x}:y=${ctaPos.y}:` +
+        `alpha='if(lt(t,${fadeInEnd.toFixed(3)}),(t-${ctaStartTime.toFixed(3)})/0.3,if(gt(t,${fadeOutStart.toFixed(3)}),1-((t-${fadeOutStart.toFixed(3)})/0.3),1))':` +
+        `enable='between(t,${ctaStartTime.toFixed(3)},${(ctaStartTime + ctaDuration).toFixed(3)})'`
+      );
+    } else {
+      // clean_endcard: Full endcard with background
+      // This creates a simple overlay without freezing the video
+      filters.push(
+        `drawtext=textfile='${tmpCTAFile}':` +
+        `fontfile='${boldFontPath}':` +
+        `fontsize=${ctaFontSize + 2}:` +
+        `fontcolor=white:` +
+        `box=1:boxcolor=black@0.7:boxborderw=20:` +
+        `x=(w-text_w)/2:y=(h-text_h)/2:` +
+        `alpha='if(lt(t,${(ctaStartTime + 0.2).toFixed(3)}),(t-${ctaStartTime.toFixed(3)})/0.2,1)':` +
+        `enable='between(t,${ctaStartTime.toFixed(3)},${(ctaStartTime + ctaDuration).toFixed(3)})'`
+      );
+    }
+
+    console.log(`[renderClip] CTA enabled: "${ctaConfig.text}" from ${ctaStartTime.toFixed(1)}s to ${(ctaStartTime + ctaDuration).toFixed(1)}s (style: ${ctaConfig.style})`);
   }
 
   const vf = filters.length > 0 ? filters.join(",") : undefined;

@@ -490,7 +490,18 @@ export interface VideoAnalysisProvider {
   scoreMoment(params: ScoreMomentParams): Promise<MomentScoreResult>;
   generateHook(params: GenerateHookParams): Promise<HookResult>;
   searchCurrentContext?(params: SearchContextParams): Promise<ResearchResult>;
+  searchMomentByDescription?(params: SearchMomentParams): Promise<MomentSearchResult>;
   explainScore(params: ExplainScoreParams): Promise<string>;
+}
+
+export interface SearchMomentParams {
+  description: string;
+  transcript: Transcript;
+  structure?: VideoStructure;
+  timeRangeStart?: number;
+  timeRangeEnd?: number;
+  maxCandidates?: number;
+  sessionId: string;
 }
 
 export interface AnalyzeVideoParams {
@@ -646,4 +657,59 @@ export interface RenderRequest {
   withHookOverlay: boolean;
   startTime: number;
   endTime: number;
+  // CTA settings
+  ctaEnabled?: boolean;
+  ctaText?: string;
+  ctaDuration?: 2 | 2.5 | 3;
+  ctaStyle?: "minimal_overlay" | "clean_endcard";
+}
+
+// ─── Natural Language Moment Search ───────────────────────────────────────────
+
+export interface MomentSearchRequest {
+  sessionId: string;
+  description: string; // Natural language description of desired moment
+  timeRangeStart?: number; // Optional: constrain search to specific range
+  timeRangeEnd?: number;
+  maxCandidates?: number; // How many candidates to return (default: 5)
+}
+
+export interface MomentSearchCandidate {
+  startTime: number;
+  endTime: number;
+  duration: number;
+  confidence: number; // 0-100, how well it matches the description
+  description: string; // Why this moment matches
+  transcriptExcerpt: string;
+  matchReasons: string[]; // Specific reasons it matched
+  hookText?: string;
+}
+
+export interface MomentSearchResult {
+  sessionId: string;
+  searchDescription: string;
+  candidates: MomentSearchCandidate[];
+  searchStrategy: string; // How the search was performed
+  latencyMs: number;
+  provider: ProviderName;
+}
+
+// ─── Exact Timestamp Mode ────────────────────────────────────────────────────
+
+export interface ExactTimestampRequest {
+  sessionId: string;
+  startTime: number;
+  endTime: number;
+  paddingBefore?: number; // seconds to include before start
+  paddingAfter?: number; // seconds to include after end
+  validateContext?: boolean; // Whether to validate the clip makes sense
+}
+
+export interface ExactTimestampResult {
+  validated: boolean;
+  adjustedStartTime: number;
+  adjustedEndTime: number;
+  warnings: string[];
+  suggestions: string[];
+  transcriptExcerpt: string;
 }

@@ -494,7 +494,7 @@ export function parseKeyConfiguration(): KeyConfig[] {
     preview: primaryKey ? `${primaryKey.slice(0, 10)}...${primaryKey.slice(-4)}` : "not set"
   });
   
-  if (primaryKey) {
+  if (primaryKey && primaryKey.length >= 20) {
     configs.push({
       key: primaryKey,
       label: "Primary Key",
@@ -502,7 +502,29 @@ export function parseKeyConfiguration(): KeyConfig[] {
     });
   }
 
-  // Additional keys from GEMINI_API_KEYS
+  // Auto-detect numbered keys: GEMINI_API_KEY1, GEMINI_API_KEY2, etc.
+  // This allows users to set multiple keys in Vercel without using GEMINI_API_KEYS JSON
+  let numberedKeysFound = 0;
+  for (let i = 1; i <= 50; i++) { // Check up to 50 numbered keys
+    const numberedKey = process.env[`GEMINI_API_KEY${i}`];
+    if (numberedKey && numberedKey.length >= 20) {
+      configs.push({
+        key: numberedKey,
+        label: `Key ${i}`,
+        quotaGroup: `group-${i}`,
+      });
+      numberedKeysFound++;
+    } else if (i > 10 && numberedKeysFound === 0) {
+      // If we've checked 10 and found none, stop early
+      break;
+    }
+  }
+  
+  if (numberedKeysFound > 0) {
+    console.log(`[GeminiKeyManager] Found ${numberedKeysFound} numbered keys (GEMINI_API_KEY1, GEMINI_API_KEY2, etc.)`);
+  }
+
+  // Additional keys from GEMINI_API_KEYS (JSON array format)
   const keysEnv = process.env.GEMINI_API_KEYS;
   console.log("[GeminiKeyManager] Checking GEMINI_API_KEYS:", {
     found: !!keysEnv,
@@ -522,13 +544,13 @@ export function parseKeyConfiguration(): KeyConfig[] {
       if (Array.isArray(parsed)) {
         for (let i = 0; i < parsed.length; i++) {
           const item = parsed[i];
-          if (typeof item === "string") {
+          if (typeof item === "string" && item.length >= 20) {
             configs.push({
               key: item,
-              label: `Additional Key ${i + 1}`,
+              label: `Pool Key ${i + 1}`,
               quotaGroup: `pool-${i + 1}`,
             });
-          } else if (typeof item === "object" && item.key) {
+          } else if (typeof item === "object" && item.key && item.key.length >= 20) {
             configs.push({
               key: item.key,
               label: item.label,
@@ -542,21 +564,30 @@ export function parseKeyConfiguration(): KeyConfig[] {
     } catch (err) {
       console.log("[GeminiKeyManager] GEMINI_API_KEYS is not valid JSON, trying comma-separated");
       // Not JSON, try comma-separated
-      const keys = keysEnv.split(",").map(k => k.trim()).filter(k => k.length > 0);
+      const keys = keysEnv.split(",").map(k => k.trim()).filter(k => k.length >= 20);
       console.log(`[GeminiKeyManager] Found ${keys.length} comma-separated keys`);
       
       for (let i = 0; i < keys.length; i++) {
         configs.push({
           key: keys[i],
-          label: `Pool Key ${i + 1}`,
-          quotaGroup: `pool-${i + 1}`,
+          label: `CSV Key ${i + 1}`,
+          quotaGroup: `csv-${i + 1}`,
         });
       }
     }
   }
 
-  console.log(`[GeminiKeyManager] Total keys configured: ${configs.length}`);
-  return configs;
+  // Deduplicate keys (in case same key appears in multiple places)
+  const uniqueConfigs = Array.from(
+    new Map(configs.map(c => [c.key, c])).values()
+  );
+
+  console.log(`[GeminiKeyManager] Total unique keys configured: ${uniqueConfigs.length}`);
+  if (uniqueConfigs.length !== configs.length) {
+    console.log(`[GeminiKeyManager] Removed ${configs.length - uniqueConfigs.length} duplicate keys`);
+  }
+
+  return uniqueConfigs;
 }
 
 export function createKeyManager(options?: {

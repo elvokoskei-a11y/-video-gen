@@ -9,6 +9,18 @@ import { NextResponse } from "next/server";
  * Usage: Visit /api/debug/env-check in your browser
  */
 export async function GET() {
+  // Check for numbered keys
+  const numberedKeys: { [key: string]: { found: boolean; length: number } } = {};
+  for (let i = 1; i <= 10; i++) {
+    const key = process.env[`GEMINI_API_KEY${i}`];
+    if (key) {
+      numberedKeys[`GEMINI_API_KEY${i}`] = {
+        found: true,
+        length: key.length,
+      };
+    }
+  }
+
   const checks = {
     gemini_api_key_singular: {
       set: !!process.env.GEMINI_API_KEY,
@@ -17,6 +29,10 @@ export async function GET() {
         ? `${process.env.GEMINI_API_KEY.slice(0, 10)}...${process.env.GEMINI_API_KEY.slice(-4)}`
         : null,
       startsWithAIza: process.env.GEMINI_API_KEY?.startsWith('AIza') || false,
+    },
+    gemini_api_keys_numbered: {
+      totalFound: Object.keys(numberedKeys).length,
+      keys: numberedKeys,
     },
     gemini_api_keys_plural: {
       set: !!process.env.GEMINI_API_KEYS,
@@ -67,11 +83,17 @@ export async function GET() {
     }
   }
 
+  const totalGeminiKeys = 
+    (checks.gemini_api_key_singular.set ? 1 : 0) +
+    checks.gemini_api_keys_numbered.totalFound +
+    checks.gemini_api_keys_plural.parsedKeyCount;
+
   const diagnosis = {
     timestamp: new Date().toISOString(),
     environment: process.env.NODE_ENV,
     summary: {
-      hasAnyGeminiKey: checks.gemini_api_key_singular.set || checks.gemini_api_keys_plural.set,
+      hasAnyGeminiKey: totalGeminiKeys > 0,
+      totalGeminiKeys: totalGeminiKeys,
       hasNvidiaKey: checks.nvidia_api_key.set,
       recommendedAction: "",
     },
@@ -79,18 +101,16 @@ export async function GET() {
   };
 
   // Generate recommendation
-  if (!checks.gemini_api_key_singular.set && !checks.gemini_api_keys_plural.set) {
-    diagnosis.summary.recommendedAction = "❌ No Gemini API keys found. Set GEMINI_API_KEY or GEMINI_API_KEYS in Vercel environment variables.";
+  if (totalGeminiKeys === 0) {
+    diagnosis.summary.recommendedAction = "❌ No Gemini API keys found. Set GEMINI_API_KEY, numbered keys (GEMINI_API_KEY1, etc.), or GEMINI_API_KEYS in Vercel environment variables.";
   } else if (checks.gemini_api_keys_plural.set && !checks.gemini_api_keys_plural.isValidJSON) {
-    diagnosis.summary.recommendedAction = `⚠️ GEMINI_API_KEYS is set but JSON is invalid. Error: ${checks.gemini_api_keys_plural.parseError}. Fix the JSON format in Vercel.`;
-  } else if (checks.gemini_api_keys_plural.set && checks.gemini_api_keys_plural.parsedKeyCount === 0) {
-    diagnosis.summary.recommendedAction = "⚠️ GEMINI_API_KEYS is set but contains 0 keys. Add keys to the array.";
+    diagnosis.summary.recommendedAction = `⚠️ GEMINI_API_KEYS is set but JSON is invalid. Error: ${checks.gemini_api_keys_plural.parseError}. Fix the JSON format in Vercel. (Note: ${totalGeminiKeys} other key(s) will still work)`;
   } else if (checks.gemini_api_key_singular.set && checks.gemini_api_key_singular.length < 20) {
     diagnosis.summary.recommendedAction = `⚠️ GEMINI_API_KEY is suspiciously short (${checks.gemini_api_key_singular.length} chars). Check if it's set correctly.`;
   } else if (checks.gemini_api_key_singular.set && !checks.gemini_api_key_singular.startsWithAIza) {
     diagnosis.summary.recommendedAction = "⚠️ GEMINI_API_KEY doesn't start with 'AIza'. Verify it's a valid Gemini key.";
   } else {
-    diagnosis.summary.recommendedAction = "✅ API keys appear to be configured correctly! If still not working, check /api/system/providers for connection test.";
+    diagnosis.summary.recommendedAction = `✅ ${totalGeminiKeys} Gemini API key(s) detected and configured correctly! If still not working, check /api/system/providers for connection test.`;
   }
 
   return NextResponse.json(diagnosis, { 

@@ -975,7 +975,12 @@ function extractSignals(reasoning: string): string[] {
 // One engine instance shared across API routes
 
 let engineInstance: ClipperEngine | null = null;
-let lastEnvCheck: { gemini: string | undefined; nvidia: string | undefined; geminiKeys: string | undefined } | null = null;
+let lastEnvCheck: { 
+  gemini: string | undefined; 
+  nvidia: string | undefined; 
+  geminiKeys: string | undefined;
+  numberedKeys: string; // Concatenated hash of all numbered keys
+} | null = null;
 
 export function getClipperEngine(): ClipperEngine {
   // Check if environment variables have changed
@@ -983,7 +988,20 @@ export function getClipperEngine(): ClipperEngine {
     gemini: process.env.GEMINI_API_KEY,
     nvidia: process.env.NVIDIA_API_KEY,
     geminiKeys: process.env.GEMINI_API_KEYS,
+    numberedKeys: "", // Will be populated below
   };
+
+  // Check for numbered keys and create a hash
+  const numberedKeysList: string[] = [];
+  for (let i = 1; i <= 50; i++) {
+    const key = process.env[`GEMINI_API_KEY${i}`];
+    if (key) {
+      numberedKeysList.push(`${i}:${key.length}`); // Track index and length
+    } else if (i > 10 && numberedKeysList.length === 0) {
+      break; // Stop early if no keys found in first 10
+    }
+  }
+  currentEnv.numberedKeys = numberedKeysList.join(',');
 
   // Reinitialize if environment has changed or first run
   if (
@@ -991,9 +1009,13 @@ export function getClipperEngine(): ClipperEngine {
     !lastEnvCheck ||
     lastEnvCheck.gemini !== currentEnv.gemini ||
     lastEnvCheck.nvidia !== currentEnv.nvidia ||
-    lastEnvCheck.geminiKeys !== currentEnv.geminiKeys
+    lastEnvCheck.geminiKeys !== currentEnv.geminiKeys ||
+    lastEnvCheck.numberedKeys !== currentEnv.numberedKeys
   ) {
     console.log("[ClipperEngine] Initializing with current environment variables");
+    if (lastEnvCheck && engineInstance) {
+      console.log("[ClipperEngine] Environment changed - reinitializing");
+    }
     engineInstance = new ClipperEngine();
     lastEnvCheck = currentEnv;
   }
